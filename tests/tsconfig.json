@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": false,
+    "baseUrl": "..",
+    "paths": { "@/*": ["./src/*"] },
+    "plugins": []
+  },
+  "include": ["./**/*.ts", "../scripts/**/*.ts", "../src/**/*.ts", "../vitest.config.mts", "../next-env.d.ts"],
+  "exclude": ["../node_modules"]
+}

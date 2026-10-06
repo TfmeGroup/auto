@@ -1,0 +1,3494 @@
+// TFME Auto — database schema (PostgreSQL).
+//
+// Conventions
+//  * snake_case columns/tables in the database, camelCase in code.
+//  * uuid primary keys (gen_random_uuid()), timestamptz timestamps.
+//  * Money is stored as integer minor units (cents) — never floats.
+//  * Every business-owned table carries business_id. Data-plane tables are also
+//    protected by Postgres row-level security (see migrations/*_security).
+//  * Emails are stored lower-cased (enforced by a CHECK constraint).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+
+  @@map("user_status")
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+  EMAIL_CHANGE
+
+  @@map("auth_token_type")
+}
+
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+  CLOSED
+
+  @@map("business_status")
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+
+  @@map("membership_status")
+}
+
+enum CustomerType {
+  INDIVIDUAL
+  BUSINESS
+
+  @@map("customer_type")
+}
+
+enum RecordStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@map("record_status")
+}
+
+enum FileStatus {
+  ACTIVE
+  ARCHIVED
+  TRASHED
+  DELETED
+
+  @@map("file_status")
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DEAD
+
+  @@map("job_status")
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+  GRACE_PERIOD
+  SUSPENDED
+
+  @@map("subscription_status")
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@map("webhook_status")
+}
+
+enum PaymentRecordStatus {
+  PENDING
+  COMPLETE
+  FAILED
+  CANCELLED
+
+  @@map("payment_record_status")
+}
+
+// ───────────────────────── Identity ─────────────────────────
+
+model User {
+  id                  String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email               String     @unique
+  emailVerifiedAt     DateTime?  @map("email_verified_at") @db.Timestamptz(3)
+  passwordHash        String     @map("password_hash")
+  firstName           String     @default("") @map("first_name")
+  lastName            String     @default("") @map("last_name")
+  // Display name; maintained by the service as "first last".
+  name                String
+  mobile              String?
+  profilePhotoKey     String?    @map("profile_photo_key")
+  status              UserStatus @default(ACTIVE)
+  deactivatedAt       DateTime?  @map("deactivated_at") @db.Timestamptz(3)
+  failedLoginCount    Int        @default(0) @map("failed_login_count")
+  lockedUntil         DateTime?  @map("locked_until") @db.Timestamptz(3)
+  lastLoginAt         DateTime?  @map("last_login_at") @db.Timestamptz(3)
+  lastLoginIp         String?    @map("last_login_ip")
+  lastLoginUserAgent  String?    @map("last_login_user_agent")
+  passwordChangedAt   DateTime?  @map("password_changed_at") @db.Timestamptz(3)
+  // MFA (TOTP). Secrets are AES-256-GCM encrypted; recovery codes are stored hashed.
+  mfaEnabled          Boolean    @default(false) @map("mfa_enabled")
+  mfaEnabledAt        DateTime?  @map("mfa_enabled_at") @db.Timestamptz(3)
+  mfaSecretEnc        String?    @map("mfa_secret_enc")
+  mfaPendingSecretEnc String?    @map("mfa_pending_secret_enc")
+  // Last accepted TOTP time-step: a code can never be used twice.
+  mfaLastUsedStep     Int        @default(0) @map("mfa_last_used_step")
+  createdAt           DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions          Session[]
+  authTokens        AuthToken[]
+  memberships       Membership[]
+  mfaChallenges     MfaChallenge[]
+  recoveryCodes     MfaRecoveryCode[]
+  notificationPrefs UserNotificationPreference[]
+  platformAdmin     PlatformAdmin?
+
+  @@map("users")
+}
+
+model Session {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  tokenHash        String    @unique @map("token_hash")
+  // Currently selected workspace. Validated against an ACTIVE membership on every request.
+  activeBusinessId String?   @map("active_business_id") @db.Uuid
+  ip               String?
+  userAgent        String?   @map("user_agent")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastUsedAt       DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model AuthToken {
+  id        String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String        @map("user_id") @db.Uuid
+  type      AuthTokenType
+  tokenHash String        @unique @map("token_hash")
+  // For EMAIL_CHANGE: the address being switched to (not trusted until the link is used).
+  newEmail  String?       @map("new_email")
+  expiresAt DateTime      @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime?     @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+model MfaChallenge {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  attempts  Int       @default(0)
+  ip        String?
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("mfa_challenges")
+}
+
+model MfaRecoveryCode {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  codeHash  String    @map("code_hash")
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, codeHash])
+  @@map("mfa_recovery_codes")
+}
+
+// Optional (non-security) email categories a person can switch off. Security alerts are never optional.
+model UserNotificationPreference {
+  userId       String  @map("user_id") @db.Uuid
+  category     String
+  emailEnabled Boolean @default(true) @map("email_enabled")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, category])
+  @@map("user_notification_preferences")
+}
+
+model PlatformAdmin {
+  userId    String   @id @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@map("platform_admins")
+}
+
+// Platform-wide tunables (trial reminders, grace periods, retention). Defaults live in code.
+model PlatformSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("platform_settings")
+}
+
+// ───────────────────────── Business & membership ─────────────────────────
+
+model Business {
+  id                  String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                String
+  tradingName         String?        @map("trading_name")
+  legalName           String?        @map("legal_name")
+  businessType        String?        @map("business_type")
+  registrationNumber  String?        @map("registration_number")
+  vatNumber           String?        @map("vat_number")
+  vatRegistered       Boolean        @default(false) @map("vat_registered")
+  // VAT rate in basis points (1500 = 15.00%). Business-level so it is not hard-coded to ZA.
+  vatRateBps          Int            @default(1500) @map("vat_rate_bps")
+  currency            String         @default("ZAR") @db.Char(3)
+  countryCode         String         @default("ZA") @map("country_code") @db.Char(2)
+  timezone            String         @default("Africa/Johannesburg")
+  locale              String         @default("en-ZA")
+  phone               String?
+  email               String?
+  website             String?
+  addressLine1        String?        @map("address_line1")
+  addressLine2        String?        @map("address_line2")
+  city                String?
+  province            String?
+  postalCode          String?        @map("postal_code")
+  billingAddressLine1 String?        @map("billing_address_line1")
+  billingAddressLine2 String?        @map("billing_address_line2")
+  billingCity         String?        @map("billing_city")
+  billingProvince     String?        @map("billing_province")
+  billingPostalCode   String?        @map("billing_postal_code")
+  logoFileId          String?        @map("logo_file_id") @db.Uuid
+  // When true, members must have MFA enabled to use the business (plan entitlement: mfa_enforcement).
+  requireMfa          Boolean        @default(false) @map("require_mfa")
+  status              BusinessStatus @default(ACTIVE)
+  createdById         String?        @map("created_by_id") @db.Uuid
+  closedAt            DateTime?      @map("closed_at") @db.Timestamptz(3)
+  closedById          String?        @map("closed_by_id") @db.Uuid
+  closeReason         String?        @map("close_reason")
+  createdAt           DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt          DateTime?      @map("archived_at") @db.Timestamptz(3)
+
+  memberships     Membership[]
+  roles           Role[]
+  locations       Location[]
+  customers       Customer[]
+  files           File[]
+  subscription    Subscription?
+  numberSequences NumberSequence[]
+  invoices        SubscriptionInvoice[]
+  exports         DataExport[]
+  vehicles        Vehicle[]
+  bookings        Booking[]
+  jobCards        JobCard[]
+  financeSettings FinanceSettings?
+  quotes          Quote[]
+  invoicesIssued  Invoice[]
+  payments        Payment[]
+  refunds         Refund[]
+  receipts        Receipt[]
+  creditNotes     CreditNote[]
+  config          BusinessConfig?
+  jobTemplates    JobTemplate[]
+  savedReports    SavedReport[]
+  reportSchedules ReportSchedule[]
+  reportRuns      ReportRun[]
+  importBatches   ImportBatch[]
+  importRows      ImportRow[]
+
+  @@map("businesses")
+}
+
+model DataExport {
+  id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String       @map("business_id") @db.Uuid
+  requestedById String?      @map("requested_by_id") @db.Uuid
+  status        ExportStatus @default(PENDING)
+  // Datasets requested, already filtered to what the requester was allowed to export.
+  scope         String[]
+  storageKey    String?      @unique @map("storage_key")
+  sizeBytes     Int?         @map("size_bytes")
+  sha256        String?
+  error         String?
+  requestedAt   DateTime     @default(now()) @map("requested_at") @db.Timestamptz(3)
+  completedAt   DateTime?    @map("completed_at") @db.Timestamptz(3)
+  expiresAt     DateTime?    @map("expires_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+
+  @@index([businessId, requestedAt(sort: Desc)])
+  @@map("data_exports")
+}
+
+model Location {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String       @map("business_id") @db.Uuid
+  name         String
+  isDefault    Boolean      @default(false) @map("is_default")
+  // Optional short code (e.g. CPT) put into this location's document numbers: INV-CPT-000001.
+  docCode      String?      @map("doc_code")
+  addressLine1 String?      @map("address_line1")
+  city         String?
+  province     String?
+  postalCode   String?      @map("postal_code")
+  phone        String?
+  email        String?
+  status       RecordStatus @default(ACTIVE)
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  access   MembershipLocation[]
+
+  @@unique([id, businessId])
+  @@index([businessId])
+  @@map("locations")
+}
+
+// System roles have business_id NULL and are immutable. Custom roles (a later
+// feature) are business-owned rows in the same table.
+model Role {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String?   @map("business_id") @db.Uuid
+  key         String
+  name        String
+  description String?
+  isSystem    Boolean   @default(false) @map("is_system")
+  // Custom roles are archived, never deleted, so history keeps pointing at them.
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business    Business?        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  memberships Membership[]
+
+  @@index([businessId])
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId     String @map("role_id") @db.Uuid
+  permission String
+
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permission])
+  @@map("role_permissions")
+}
+
+model Membership {
+  id                     String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String           @map("business_id") @db.Uuid
+  // NULL while an invitation is outstanding and unclaimed.
+  userId                 String?          @map("user_id") @db.Uuid
+  roleId                 String           @map("role_id") @db.Uuid
+  status                 MembershipStatus @default(INVITED)
+  // Maintained by a database trigger: true when the role is the system Owner role.
+  // A partial unique index allows exactly one ACTIVE owner per business.
+  isOwner                Boolean          @default(false) @map("is_owner")
+  invitedEmail           String?          @map("invited_email")
+  inviteTokenHash        String?          @unique @map("invite_token_hash")
+  inviteExpiresAt        DateTime?        @map("invite_expires_at") @db.Timestamptz(3)
+  invitedById            String?          @map("invited_by_id") @db.Uuid
+  invitedAt              DateTime?        @map("invited_at") @db.Timestamptz(3)
+  joinedAt               DateTime?        @map("joined_at") @db.Timestamptz(3)
+  // When true the member may use every location; otherwise only MembershipLocation rows.
+  allLocations           Boolean          @default(true) @map("all_locations")
+  // What an hour of this person's time costs the business (operational gross profit only; never shown to customers).
+  labourCostCentsPerHour Int?             @map("labour_cost_cents_per_hour")
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business  Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user      User?                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role      Role                 @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  locations MembershipLocation[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, userId])
+  @@index([userId])
+  @@index([businessId, status])
+  @@map("memberships")
+}
+
+model MembershipLocation {
+  membershipId String @map("membership_id") @db.Uuid
+  locationId   String @map("location_id") @db.Uuid
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  location   Location   @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@id([membershipId, locationId])
+  @@map("membership_locations")
+}
+
+// Per-business, per-document-kind counters (CUST-0001, JOB-1045, ...).
+model NumberSequence {
+  businessId String   @map("business_id") @db.Uuid
+  kind       String
+  prefix     String
+  nextValue  Int      @default(1) @map("next_value")
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@id([businessId, kind])
+  @@map("number_sequences")
+}
+
+// ───────────────────────── Audit ─────────────────────────
+
+// Append-only: a database trigger rejects UPDATE/DELETE, and the application
+// role is only granted SELECT + INSERT.
+model AuditLog {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String?  @map("business_id") @db.Uuid
+  userId       String?  @map("user_id") @db.Uuid
+  action       String
+  resourceType String?  @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  metadata     Json?
+  before       Json?
+  after        Json?
+  ip           String?
+  userAgent    String?  @map("user_agent")
+  requestId    String?  @map("request_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, createdAt(sort: Desc)])
+  @@index([businessId, resourceType, resourceId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// ───────────────────────── Files ─────────────────────────
+
+model File {
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId     String             @map("business_id") @db.Uuid
+  uploadedById   String?            @map("uploaded_by_id") @db.Uuid
+  storageKey     String             @unique @map("storage_key")
+  originalName   String             @map("original_name")
+  mimeType       String             @map("mime_type")
+  sizeBytes      Int                @map("size_bytes")
+  sha256         String
+  // Polymorphic association to the owning record (customer, job, vehicle, ...).
+  resourceType   String?            @map("resource_type")
+  resourceId     String?            @map("resource_id")
+  status         FileStatus         @default(ACTIVE)
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  archivedAt     DateTime?          @map("archived_at") @db.Timestamptz(3)
+  // Part 6: the shared document system.
+  displayName    String?            @map("display_name")
+  extension      String?
+  description    String?
+  category       String             @default("OTHER")
+  visibility     DocumentVisibility @default(INTERNAL)
+  version        Int                @default(1)
+  versionGroupId String?            @map("version_group_id") @db.Uuid
+  isCurrent      Boolean            @default(true) @map("is_current")
+  source         FileSource         @default(UPLOAD)
+  generatedKind  String?            @map("generated_kind")
+  generatedRef   String?            @map("generated_ref")
+  locationId     String?            @map("location_id") @db.Uuid
+  customerId     String?            @map("customer_id") @db.Uuid
+  scanStatus     ScanStatus         @default(NOT_SCANNED) @map("scan_status")
+  scannedAt      DateTime?          @map("scanned_at") @db.Timestamptz(3)
+  thumbnailKey   String?            @map("thumbnail_key")
+  isFinancial    Boolean            @default(false) @map("is_financial")
+  retainUntil    DateTime?          @map("retain_until") @db.Timestamptz(3)
+  trashedAt      DateTime?          @map("trashed_at") @db.Timestamptz(3)
+  trashedById    String?            @map("trashed_by_id") @db.Uuid
+  deletedAt      DateTime?          @map("deleted_at") @db.Timestamptz(3)
+  updatedAt      DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, resourceType, resourceId])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@index([businessId, status, category])
+  @@index([businessId, customerId, createdAt(sort: Desc)])
+  @@index([businessId, uploadedById, createdAt(sort: Desc)])
+  @@index([businessId, visibility])
+  @@index([businessId, versionGroupId, version])
+  @@map("files")
+}
+
+// ───────────────────────── Notifications ─────────────────────────
+
+model Notification {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String    @map("business_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  type       String
+  title      String
+  body       String?
+  linkUrl    String?   @map("link_url")
+  readAt     DateTime? @map("read_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  // Part 6: structured notifications.
+  priority   String    @default("NORMAL")
+  entityType String?   @map("entity_type")
+  entityId   String?   @map("entity_id") @db.Uuid
+  groupKey   String?   @map("group_key")
+  groupCount Int       @default(1) @map("group_count")
+
+  @@index([businessId, userId, readAt, createdAt(sort: Desc)])
+  @@index([businessId, userId, groupKey])
+  @@map("notifications")
+}
+
+// ───────────────────────── Background jobs & infra ─────────────────────────
+
+model Job {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type        String
+  payload     Json      @default("{}")
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5) @map("max_attempts")
+  runAt       DateTime  @default(now()) @map("run_at") @db.Timestamptz(3)
+  lockedAt    DateTime? @map("locked_at") @db.Timestamptz(3)
+  lockedBy    String?   @map("locked_by")
+  lastError   String?   @map("last_error")
+  // Prevents duplicate enqueueing of the same logical job (e.g. one email per event).
+  dedupeKey   String?   @unique @map("dedupe_key")
+  businessId  String?   @map("business_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  @@index([status, runAt])
+  @@map("jobs")
+}
+
+model RateLimitBucket {
+  key         String   @id
+  count       Int      @default(0)
+  windowStart DateTime @default(now()) @map("window_start") @db.Timestamptz(3)
+
+  @@map("rate_limit_buckets")
+}
+
+// ───────────────────────── Billing ─────────────────────────
+
+model Plan {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key             String          @unique
+  name            String
+  // Price per billing interval in minor units (cents), VAT-exclusive. NULL = not priced yet:
+  // such a plan cannot be purchased online (checkout refuses) until pricing is configured.
+  priceCents      Int?            @map("price_cents")
+  billingInterval BillingInterval @default(MONTHLY) @map("billing_interval")
+  maxMembers      Int             @map("max_members")
+  maxLocations    Int             @map("max_locations")
+  maxStorageMb    Int             @map("max_storage_mb")
+  // Self-serve plans can be bought online; custom plans are assigned by the platform team.
+  isCustom        Boolean         @default(false) @map("is_custom")
+  isPublic        Boolean         @default(true) @map("is_public")
+  status          PlanStatus      @default(ACTIVE)
+  effectiveFrom   DateTime?       @map("effective_from") @db.Timestamptz(3)
+  effectiveTo     DateTime?       @map("effective_to") @db.Timestamptz(3)
+  sortOrder       Int             @default(0) @map("sort_order")
+
+  features      PlanFeature[]
+  subscriptions Subscription[]        @relation("CurrentPlan")
+  pendingFor    Subscription[]        @relation("PendingPlan")
+  payments      SubscriptionPayment[]
+
+  @@map("plans")
+}
+
+// Feature entitlements per plan. A missing row means "not included".
+model PlanFeature {
+  planId     String  @map("plan_id") @db.Uuid
+  featureKey String  @map("feature_key")
+  enabled    Boolean @default(true)
+
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@id([planId, featureKey])
+  @@map("plan_features")
+}
+
+model Subscription {
+  id                      String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId              String             @unique @map("business_id") @db.Uuid
+  planId                  String             @map("plan_id") @db.Uuid
+  status                  SubscriptionStatus @default(TRIALING)
+  trialStartedAt          DateTime?          @map("trial_started_at") @db.Timestamptz(3)
+  trialEndsAt             DateTime?          @map("trial_ends_at") @db.Timestamptz(3)
+  // Set when a paid subscription first starts after a trial.
+  convertedAt             DateTime?          @map("converted_at") @db.Timestamptz(3)
+  currentPeriodStart      DateTime?          @map("current_period_start") @db.Timestamptz(3)
+  currentPeriodEnd        DateTime?          @map("current_period_end") @db.Timestamptz(3)
+  // When a payment first failed (or the paid period lapsed unpaid). Drives past-due -> grace -> suspended.
+  pastDueSince            DateTime?          @map("past_due_since") @db.Timestamptz(3)
+  cancelAtPeriodEnd       Boolean            @default(false) @map("cancel_at_period_end")
+  canceledAt              DateTime?          @map("canceled_at") @db.Timestamptz(3)
+  canceledById            String?            @map("canceled_by_id") @db.Uuid
+  cancelReason            String?            @map("cancel_reason")
+  // A scheduled downgrade, applied when the current paid period ends.
+  pendingPlanId           String?            @map("pending_plan_id") @db.Uuid
+  pendingChangeAt         DateTime?          @map("pending_change_at") @db.Timestamptz(3)
+  // Contract overrides for CUSTOM plans (set by the platform team only).
+  overrideMaxMembers      Int?               @map("override_max_members")
+  overrideMaxLocations    Int?               @map("override_max_locations")
+  overrideMaxStorageMb    Int?               @map("override_max_storage_mb")
+  provider                String?
+  providerSubscriptionRef String?            @map("provider_subscription_ref")
+  // Display-only summary from the provider (e.g. "Visa ending 4242"); never card data.
+  paymentMethodSummary    String?            @map("payment_method_summary")
+  // What the provider will charge per period from now on. Recurring webhooks are checked against this.
+  recurringAmountCents    Int?               @map("recurring_amount_cents")
+  createdAt               DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business    Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  plan        Plan                  @relation("CurrentPlan", fields: [planId], references: [id])
+  pendingPlan Plan?                 @relation("PendingPlan", fields: [pendingPlanId], references: [id])
+  payments    SubscriptionPayment[]
+  invoices    SubscriptionInvoice[]
+
+  @@map("subscriptions")
+}
+
+// A tax invoice TFME issues to the business for each completed subscription payment.
+model SubscriptionInvoice {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId     String   @map("business_id") @db.Uuid
+  subscriptionId String   @map("subscription_id") @db.Uuid
+  paymentId      String   @unique @map("payment_id") @db.Uuid
+  number         String   @unique
+  planName       String   @map("plan_name")
+  description    String
+  subtotalCents  Int      @map("subtotal_cents")
+  vatCents       Int      @map("vat_cents")
+  totalCents     Int      @map("total_cents")
+  vatRateBps     Int      @map("vat_rate_bps")
+  currency       String   @default("ZAR") @db.Char(3)
+  issuedAt       DateTime @default(now()) @map("issued_at") @db.Timestamptz(3)
+
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+
+  @@index([businessId, issuedAt(sort: Desc)])
+  @@map("subscription_invoices")
+}
+
+model SubscriptionPayment {
+  id                String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String              @map("business_id") @db.Uuid
+  subscriptionId    String              @map("subscription_id") @db.Uuid
+  // Plan being purchased; applied to the subscription when the payment completes.
+  planId            String              @map("plan_id") @db.Uuid
+  provider          String
+  // Null until the provider reports a payment id for this attempt.
+  providerPaymentId String?             @map("provider_payment_id")
+  amountCents       Int                 @map("amount_cents")
+  status            PaymentRecordStatus
+  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  plan         Plan         @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerPaymentId])
+  @@index([businessId])
+  @@map("subscription_payments")
+}
+
+// Every inbound webhook is stored before it is processed. (provider, external_id)
+// is the idempotency key that makes redelivery harmless.
+model WebhookEvent {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider       String
+  externalId     String        @map("external_id")
+  eventType      String        @map("event_type")
+  payload        Json
+  signatureValid Boolean       @map("signature_valid")
+  status         WebhookStatus @default(RECEIVED)
+  error          String?
+  receivedAt     DateTime      @default(now()) @map("received_at") @db.Timestamptz(3)
+  processedAt    DateTime?     @map("processed_at") @db.Timestamptz(3)
+
+  @@unique([provider, externalId])
+  @@map("webhook_events")
+}
+
+// ───────────────────────── Customers (reference module) ─────────────────────────
+// Deliberately minimal: it exists to prove the full module pattern (schema, RLS,
+// permissions, audit, search, pagination, API, UI). Part 2 extends it.
+
+model Customer {
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String         @map("business_id") @db.Uuid
+  customerNumber     String         @map("customer_number")
+  type               CustomerType   @default(INDIVIDUAL)
+  // Display/search name, maintained by the service as "first last".
+  name               String
+  firstName          String         @default("") @map("first_name")
+  lastName           String         @default("") @map("last_name")
+  companyName        String?        @map("company_name")
+  companyRegNumber   String?        @map("company_registration_number")
+  idNumber           String?        @map("id_number")
+  email              String?
+  mobile             String?
+  altPhone           String?        @map("alt_phone")
+  preferredContact   ContactMethod? @map("preferred_contact")
+  marketingConsent   Boolean        @default(false) @map("marketing_consent")
+  marketingConsentAt DateTime?      @map("marketing_consent_at") @db.Timestamptz(3)
+  emergencyName      String?        @map("emergency_contact_name")
+  emergencyPhone     String?        @map("emergency_contact_phone")
+  addressLine1       String?        @map("address_line1")
+  addressLine2       String?        @map("address_line2")
+  city               String?
+  province           String?
+  postalCode         String?        @map("postal_code")
+  notes              String?
+  status             CustomerStatus @default(ACTIVE)
+  createdById        String?        @map("created_by_id") @db.Uuid
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt         DateTime?      @map("archived_at") @db.Timestamptz(3)
+
+  business      Business              @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  vehicles      Vehicle[]
+  jobs          JobCard[]
+  bookings      Booking[]
+  quotes        Quote[]
+  invoices      Invoice[]
+  payments      Payment[]
+  creditNotes   CreditNote[]
+  creditEntries CustomerCreditEntry[]
+
+  // (id, business_id) lets other tables use a composite FK so a vehicle/job can
+  // never point at a customer from a different business.
+  @@unique([id, businessId])
+  @@unique([businessId, customerNumber])
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@map("customers")
+}
+
+enum BillingInterval {
+  MONTHLY
+  ANNUAL
+
+  @@map("billing_interval")
+}
+
+enum PlanStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@map("plan_status")
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+  EXPIRED
+
+  @@map("export_status")
+}
+
+// ═════════════════════════ Part 3: workshop operations ═════════════════════════
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+
+  @@map("customer_status")
+}
+
+enum ContactMethod {
+  PHONE
+  SMS
+  WHATSAPP
+  EMAIL
+
+  @@map("contact_method")
+}
+
+enum FuelType {
+  PETROL
+  DIESEL
+  HYBRID
+  ELECTRIC
+  LPG
+  OTHER
+
+  @@map("fuel_type")
+}
+
+enum Transmission {
+  MANUAL
+  AUTOMATIC
+  CVT
+  DCT
+  OTHER
+
+  @@map("transmission")
+}
+
+enum DriveType {
+  FWD
+  RWD
+  AWD
+  FOUR_BY_FOUR
+  OTHER
+
+  @@map("drive_type")
+}
+
+enum VehicleStatus {
+  ACTIVE
+  AWAITING_SERVICE
+  IN_WORKSHOP
+  AWAITING_PARTS
+  REPAIR_REQUIRED
+  INACTIVE
+
+  @@map("vehicle_status")
+}
+
+enum MileageSource {
+  CREATED
+  MANUAL
+  BOOKING
+  CHECK_IN
+  JOB_CREATED
+  SERVICE
+  JOB_COMPLETION
+  CORRECTION
+
+  @@map("mileage_source")
+}
+
+enum BookingStatus {
+  REQUESTED
+  CONFIRMED
+  REMINDER_SENT
+  CHECKED_IN
+  NO_SHOW
+  CANCELLED
+  RESCHEDULED
+  COMPLETED
+
+  @@map("booking_status")
+}
+
+enum JobCardStatus {
+  BOOKED
+  CHECKED_IN
+  INSPECTION
+  DIAGNOSIS
+  AWAITING_APPROVAL
+  APPROVED
+  AWAITING_PARTS
+  IN_PROGRESS
+  QUALITY_CHECK
+  READY_FOR_COLLECTION
+  COMPLETED
+  CANCELLED
+  ON_HOLD
+
+  @@map("job_card_status")
+}
+
+enum JobPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+
+  @@map("job_priority")
+}
+
+enum InspectionStatus {
+  IN_PROGRESS
+  COMPLETED
+
+  @@map("inspection_status")
+}
+
+enum InspectionCategory {
+  EXTERIOR
+  TYRES_WHEELS
+  MECHANICAL
+  OTHER
+
+  @@map("inspection_category")
+}
+
+enum InspectionItemStatus {
+  NOT_CHECKED
+  GOOD
+  ATTENTION
+  CRITICAL
+
+  @@map("inspection_item_status")
+}
+
+enum WorkPriority {
+  RECOMMENDED
+  IMPORTANT
+  URGENT
+
+  @@map("work_priority")
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  DECLINED
+
+  @@map("approval_status")
+}
+
+enum ApprovalMethod {
+  ELECTRONIC
+  IN_PERSON
+  PHONE
+  WRITTEN
+  OTHER
+
+  @@map("approval_method")
+}
+
+enum WorkSource {
+  INSPECTION_ITEM
+  DIAGNOSIS
+  MANUAL
+
+  @@map("work_source")
+}
+
+enum Visibility {
+  INTERNAL
+  CUSTOMER
+
+  @@map("visibility")
+}
+
+enum PhotoCategory {
+  CHECK_IN_FRONT
+  CHECK_IN_REAR
+  CHECK_IN_LEFT
+  CHECK_IN_RIGHT
+  PARTS
+  CHECK_IN_EXTERIOR
+  CHECK_IN_DAMAGE
+  CHECK_IN_WHEELS
+  CHECK_IN_INTERIOR
+  CHECK_IN_DASHBOARD
+  CHECK_IN_MILEAGE
+  CHECK_IN_ENGINE_BAY
+  BEFORE_REPAIR
+  DURING_REPAIR
+  DAMAGED_COMPONENT
+  DIAGNOSTIC_EVIDENCE
+  COMPLETED_REPAIR
+  SIGNATURE
+  OTHER
+
+  @@map("photo_category")
+}
+
+enum FuelLevel {
+  EMPTY
+  QUARTER
+  HALF
+  THREE_QUARTERS
+  FULL
+
+  @@map("fuel_level")
+}
+
+enum PartStatus {
+  REQUESTED
+  RESERVED
+  ORDERED
+  FITTED
+  RETURNED
+
+  @@map("part_status")
+}
+
+enum WaitingStatus {
+  WAITING
+  CONTACTED
+  BOOKED
+  CANCELLED
+
+  @@map("waiting_status")
+}
+
+enum RecurrenceFrequency {
+  WEEKLY
+  MONTHLY
+
+  @@map("recurrence_frequency")
+}
+
+enum RuleStatus {
+  ACTIVE
+  ENDED
+  CANCELLED
+
+  @@map("rule_status")
+}
+
+enum TimeOffKind {
+  LEAVE
+  DAY_OFF
+  SICK
+  OTHER
+
+  @@map("time_off_kind")
+}
+
+// ───────── Workshop configuration ─────────
+
+model ServiceType {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String       @map("business_id") @db.Uuid
+  name                   String
+  defaultDurationMin     Int          @default(60) @map("default_duration_min")
+  // What an hour of labour costs the customer for this kind of service (overrides the business default).
+  labourRateCentsPerHour Int?         @map("labour_rate_cents_per_hour")
+  status                 RecordStatus @default(ACTIVE)
+  sortOrder              Int          @default(0) @map("sort_order")
+  // Part 7 service catalogue.
+  description            String?
+  defaultPriceCents      Int?         @map("default_price_cents")
+  taxTreatment           TaxTreatment @default(STANDARD) @map("tax_treatment")
+  checklist              String[]     @default([])
+  defaultParts           Json         @default("[]") @map("default_parts")
+  createdAt              DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  templates JobTemplate[]
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("service_types")
+}
+
+model Bay {
+  id         String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String       @map("business_id") @db.Uuid
+  locationId String?      @map("location_id") @db.Uuid
+  name       String
+  status     RecordStatus @default(ACTIVE)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("bays")
+}
+
+// One row per business. Absent row = the defaults below.
+model WorkshopSettings {
+  businessId               String   @id @map("business_id") @db.Uuid
+  // false = a technician cannot be booked into two overlapping appointments.
+  allowTechnicianOverlap   Boolean  @default(false) @map("allow_technician_overlap")
+  // Maximum appointments (bookings) that may overlap at once across the workshop; null = unlimited.
+  maxConcurrentJobs        Int?     @map("max_concurrent_jobs")
+  requireCheckInSignature  Boolean  @default(false) @map("require_checkin_signature")
+  requireRescheduleReason  Boolean  @default(false) @map("require_reschedule_reason")
+  notifyCustomerReschedule Boolean  @default(true) @map("notify_customer_on_reschedule")
+  notifyCustomerCancel     Boolean  @default(true) @map("notify_customer_on_cancel")
+  // Part 7 booking rules.
+  bufferMinutes            Int      @default(0) @map("buffer_minutes")
+  minLeadMinutes           Int      @default(0) @map("min_lead_minutes")
+  cancelWindowHours        Int      @default(0) @map("cancel_window_hours")
+  maxDailyBookings         Int?     @map("max_daily_bookings")
+  allowWalkIns             Boolean  @default(true) @map("allow_walk_ins")
+  waitingListEnabled       Boolean  @default(true) @map("waiting_list_enabled")
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("workshop_settings")
+}
+
+// Opening hours; several rows per weekday are allowed (a gap is a break). 0 = Sunday.
+model WorkshopHours {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String @map("business_id") @db.Uuid
+  weekday     Int
+  startMinute Int    @map("start_minute")
+  endMinute   Int    @map("end_minute")
+
+  @@index([businessId, weekday])
+  @@map("workshop_hours")
+}
+
+// A technician's own working hours. No rows at all = the workshop's hours apply.
+model TechnicianSchedule {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String @map("business_id") @db.Uuid
+  membershipId String @map("membership_id") @db.Uuid
+  weekday      Int
+  startMinute  Int    @map("start_minute")
+  endMinute    Int    @map("end_minute")
+
+  @@index([businessId, membershipId, weekday])
+  @@map("technician_schedules")
+}
+
+model TechnicianTimeOff {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String      @map("business_id") @db.Uuid
+  membershipId String      @map("membership_id") @db.Uuid
+  kind         TimeOffKind @default(LEAVE)
+  startsAt     DateTime    @map("starts_at") @db.Timestamptz(3)
+  endsAt       DateTime    @map("ends_at") @db.Timestamptz(3)
+  reason       String?
+  createdById  String?     @map("created_by_id") @db.Uuid
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, membershipId, startsAt])
+  @@map("technician_time_off")
+}
+
+// ───────── Vehicles ─────────
+
+model Vehicle {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String        @map("business_id") @db.Uuid
+  customerId       String        @map("customer_id") @db.Uuid
+  registration     String?
+  // Upper-case letters and digits only; what uniqueness and search use.
+  registrationNorm String?       @map("registration_norm")
+  vin              String?
+  make             String?
+  model            String?
+  year             Int?
+  variant          String?
+  colour           String?
+  engine           String?
+  engineSizeCc     Int?          @map("engine_size_cc")
+  fuelType         FuelType?     @map("fuel_type")
+  transmission     Transmission?
+  driveType        DriveType?    @map("drive_type")
+  // Latest accepted odometer reading (kept in step with vehicle_mileage_log by the service).
+  mileageKm        Int?          @map("mileage_km")
+  status           VehicleStatus @default(ACTIVE)
+  notes            String?
+  createdById      String?       @map("created_by_id") @db.Uuid
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt       DateTime?     @map("archived_at") @db.Timestamptz(3)
+
+  business  Business          @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer  Customer          @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  contacts  VehicleContact[]
+  mileage   VehicleMileage[]
+  intervals ServiceInterval[]
+  jobs      JobCard[]
+  bookings  Booking[]
+  quotes    Quote[]
+  invoices  Invoice[]
+
+  @@unique([id, businessId])
+  @@index([businessId, customerId])
+  @@index([businessId, status])
+  @@map("vehicles")
+}
+
+model VehicleContact {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String   @map("business_id") @db.Uuid
+  vehicleId    String   @map("vehicle_id") @db.Uuid
+  name         String
+  mobile       String?
+  email        String?
+  relationship String?
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, vehicleId])
+  @@map("vehicle_contacts")
+}
+
+// Append-only odometer history. A correction is a new row, never an edit.
+model VehicleMileage {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String        @map("business_id") @db.Uuid
+  vehicleId    String        @map("vehicle_id") @db.Uuid
+  mileageKm    Int           @map("mileage_km")
+  source       MileageSource
+  jobId        String?       @map("job_id") @db.Uuid
+  bookingId    String?       @map("booking_id") @db.Uuid
+  isCorrection Boolean       @default(false) @map("is_correction")
+  note         String?
+  recordedById String?       @map("recorded_by_id") @db.Uuid
+  recordedAt   DateTime      @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, vehicleId, recordedAt(sort: Desc)])
+  @@map("vehicle_mileage_log")
+}
+
+// Maintenance schedule: due by distance, by time, or both (whichever comes first).
+model ServiceInterval {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String    @map("business_id") @db.Uuid
+  vehicleId     String    @map("vehicle_id") @db.Uuid
+  serviceTypeId String?   @map("service_type_id") @db.Uuid
+  name          String
+  everyKm       Int?      @map("every_km")
+  everyMonths   Int?      @map("every_months")
+  lastServiceAt DateTime? @map("last_service_at") @db.Timestamptz(3)
+  lastServiceKm Int?      @map("last_service_km")
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, vehicleId])
+  @@map("service_intervals")
+}
+
+// ───────── Bookings ─────────
+
+model RecurringBookingRule {
+  id                     String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String              @map("business_id") @db.Uuid
+  customerId             String              @map("customer_id") @db.Uuid
+  vehicleId              String              @map("vehicle_id") @db.Uuid
+  serviceTypeId          String?             @map("service_type_id") @db.Uuid
+  serviceLabel           String              @map("service_label")
+  technicianMembershipId String?             @map("technician_membership_id") @db.Uuid
+  bayId                  String?             @map("bay_id") @db.Uuid
+  locationId             String?             @map("location_id") @db.Uuid
+  frequency              RecurrenceFrequency
+  intervalCount          Int                 @default(1) @map("interval_count")
+  // Local (business time) calendar date and minute-of-day of the first occurrence.
+  startDate              DateTime            @map("start_date") @db.Date
+  startMinute            Int                 @map("start_minute")
+  durationMin            Int                 @map("duration_min")
+  endDate                DateTime?           @map("end_date") @db.Date
+  occurrences            Int?
+  status                 RuleStatus          @default(ACTIVE)
+  notes                  String?
+  createdById            String?             @map("created_by_id") @db.Uuid
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("recurring_booking_rules")
+}
+
+model Booking {
+  id                     String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String        @map("business_id") @db.Uuid
+  bookingNumber          String        @map("booking_number")
+  customerId             String        @map("customer_id") @db.Uuid
+  vehicleId              String        @map("vehicle_id") @db.Uuid
+  serviceTypeId          String?       @map("service_type_id") @db.Uuid
+  // The service name as it was when booked, so renaming the catalogue never rewrites history.
+  serviceLabel           String        @map("service_label")
+  startsAt               DateTime      @map("starts_at") @db.Timestamptz(3)
+  endsAt                 DateTime      @map("ends_at") @db.Timestamptz(3)
+  durationMin            Int           @map("duration_min")
+  technicianMembershipId String?       @map("technician_membership_id") @db.Uuid
+  bayId                  String?       @map("bay_id") @db.Uuid
+  locationId             String?       @map("location_id") @db.Uuid
+  status                 BookingStatus @default(CONFIRMED)
+  isWalkIn               Boolean       @default(false) @map("is_walk_in")
+  recurringRuleId        String?       @map("recurring_rule_id") @db.Uuid
+  customerNotes          String?       @map("customer_notes")
+  internalNotes          String?       @map("internal_notes")
+  expectedMileageKm      Int?          @map("expected_mileage_km")
+  reminderSentAt         DateTime?     @map("reminder_sent_at") @db.Timestamptz(3)
+  checkedInAt            DateTime?     @map("checked_in_at") @db.Timestamptz(3)
+  cancelledAt            DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById          String?       @map("cancelled_by_id") @db.Uuid
+  cancelReason           String?       @map("cancel_reason")
+  createdById            String?       @map("created_by_id") @db.Uuid
+  createdAt              DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer Customer       @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  vehicle  Vehicle        @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+  events   BookingEvent[]
+  job      JobCard?
+
+  @@unique([id, businessId])
+  @@unique([businessId, bookingNumber])
+  @@index([businessId, startsAt])
+  @@index([businessId, status, startsAt])
+  @@index([businessId, technicianMembershipId, startsAt])
+  @@index([businessId, customerId])
+  @@index([businessId, vehicleId])
+  @@map("bookings")
+}
+
+// Append-only booking history (created, rescheduled with old/new times, cancelled, status changes...).
+model BookingEvent {
+  id                         String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId                 String         @map("business_id") @db.Uuid
+  bookingId                  String         @map("booking_id") @db.Uuid
+  type                       String
+  fromStatus                 BookingStatus? @map("from_status")
+  toStatus                   BookingStatus? @map("to_status")
+  fromStartsAt               DateTime?      @map("from_starts_at") @db.Timestamptz(3)
+  toStartsAt                 DateTime?      @map("to_starts_at") @db.Timestamptz(3)
+  fromTechnicianMembershipId String?        @map("from_technician_membership_id") @db.Uuid
+  toTechnicianMembershipId   String?        @map("to_technician_membership_id") @db.Uuid
+  reason                     String?
+  userId                     String?        @map("user_id") @db.Uuid
+  createdAt                  DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  booking Booking @relation(fields: [bookingId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, bookingId, createdAt])
+  @@map("booking_events")
+}
+
+model WaitingListEntry {
+  id                   String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId           String         @map("business_id") @db.Uuid
+  customerId           String         @map("customer_id") @db.Uuid
+  vehicleId            String?        @map("vehicle_id") @db.Uuid
+  serviceTypeId        String?        @map("service_type_id") @db.Uuid
+  serviceLabel         String         @map("service_label")
+  preferredDate        DateTime?      @map("preferred_date") @db.Date
+  preferredStartMinute Int?           @map("preferred_start_minute")
+  preferredEndMinute   Int?           @map("preferred_end_minute")
+  contactPreference    ContactMethod? @map("contact_preference")
+  notes                String?
+  status               WaitingStatus  @default(WAITING)
+  bookingId            String?        @map("booking_id") @db.Uuid
+  createdById          String?        @map("created_by_id") @db.Uuid
+  createdAt            DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([businessId, status, createdAt])
+  @@map("waiting_list_entries")
+}
+
+// ───────── Job cards ─────────
+
+model JobCard {
+  id                            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId                    String         @map("business_id") @db.Uuid
+  jobNumber                     String         @map("job_number")
+  customerId                    String         @map("customer_id") @db.Uuid
+  vehicleId                     String         @map("vehicle_id") @db.Uuid
+  bookingId                     String?        @map("booking_id") @db.Uuid
+  status                        JobCardStatus  @default(CHECKED_IN)
+  // Where the job resumes when taken off hold.
+  heldFromStatus                JobCardStatus? @map("held_from_status")
+  priority                      JobPriority    @default(NORMAL)
+  serviceTypeId                 String?        @map("service_type_id") @db.Uuid
+  serviceLabel                  String?        @map("service_label")
+  complaint                     String?
+  isWalkIn                      Boolean        @default(false) @map("is_walk_in")
+  mileageInKm                   Int?           @map("mileage_in_km")
+  mileageOutKm                  Int?           @map("mileage_out_km")
+  primaryTechnicianMembershipId String?        @map("primary_technician_membership_id") @db.Uuid
+  advisorMembershipId           String?        @map("advisor_membership_id") @db.Uuid
+  locationId                    String?        @map("location_id") @db.Uuid
+  bayId                         String?        @map("bay_id") @db.Uuid
+  estimatedCompletionAt         DateTime?      @map("estimated_completion_at") @db.Timestamptz(3)
+  openedAt                      DateTime       @default(now()) @map("opened_at") @db.Timestamptz(3)
+  completedAt                   DateTime?      @map("completed_at") @db.Timestamptz(3)
+  completedById                 String?        @map("completed_by_id") @db.Uuid
+  completionSummary             String?        @map("completion_summary")
+  cancelledAt                   DateTime?      @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason                  String?        @map("cancel_reason")
+  createdById                   String?        @map("created_by_id") @db.Uuid
+  createdAt                     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business      Business          @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer      Customer          @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  vehicle       Vehicle           @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+  booking       Booking?          @relation(fields: [bookingId, businessId], references: [id, businessId], onDelete: Restrict)
+  checkIn       JobCheckIn?
+  technicians   JobTechnician[]
+  notes         JobNote[]
+  photos        JobPhoto[]
+  inspections   Inspection[]
+  diagnoses     Diagnosis[]
+  work          RecommendedWork[]
+  parts         JobPart[]
+  labour        JobLabour[]
+  qualityChecks JobQualityCheck[]
+  quotes        Quote[]
+  invoices      Invoice[]
+
+  @@unique([id, businessId])
+  @@unique([id, businessId, vehicleId, customerId])
+  @@unique([businessId, jobNumber])
+  @@unique([bookingId, businessId])
+  @@index([businessId, status, openedAt(sort: Desc)])
+  @@index([businessId, primaryTechnicianMembershipId, status])
+  @@index([businessId, customerId])
+  @@index([businessId, vehicleId])
+  @@map("job_cards")
+}
+
+model JobTechnician {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String   @map("business_id") @db.Uuid
+  jobId        String   @map("job_id") @db.Uuid
+  membershipId String   @map("membership_id") @db.Uuid
+  addedById    String?  @map("added_by_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([jobId, membershipId])
+  @@index([businessId, membershipId])
+  @@map("job_technicians")
+}
+
+model JobCheckIn {
+  id               String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String     @map("business_id") @db.Uuid
+  jobId            String     @unique @map("job_id") @db.Uuid
+  arrivedAt        DateTime   @map("arrived_at") @db.Timestamptz(3)
+  mileageKm        Int?       @map("mileage_km")
+  fuelLevel        FuelLevel? @map("fuel_level")
+  existingDamage   String?    @map("existing_damage")
+  vehicleCondition String?    @map("vehicle_condition")
+  keysAccessories  String?    @map("keys_accessories")
+  notes            String?
+  signatureName    String?    @map("signature_name")
+  signatureFileId  String?    @map("signature_file_id") @db.Uuid
+  signedAt         DateTime?  @map("signed_at") @db.Timestamptz(3)
+  checkedInById    String?    @map("checked_in_by_id") @db.Uuid
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([jobId, businessId])
+  @@map("job_check_ins")
+}
+
+model JobNote {
+  id         String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String     @map("business_id") @db.Uuid
+  jobId      String     @map("job_id") @db.Uuid
+  body       String
+  visibility Visibility @default(INTERNAL)
+  authorId   String?    @map("author_id") @db.Uuid
+  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  archivedAt DateTime?  @map("archived_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, jobId, createdAt])
+  @@map("job_notes")
+}
+
+model JobPhoto {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String        @map("business_id") @db.Uuid
+  jobId            String        @map("job_id") @db.Uuid
+  vehicleId        String        @map("vehicle_id") @db.Uuid
+  fileId           String        @unique @map("file_id") @db.Uuid
+  category         PhotoCategory @default(OTHER)
+  visibility       Visibility    @default(INTERNAL)
+  description      String?
+  inspectionItemId String?       @map("inspection_item_id") @db.Uuid
+  diagnosisId      String?       @map("diagnosis_id") @db.Uuid
+  uploadedById     String?       @map("uploaded_by_id") @db.Uuid
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  archivedAt       DateTime?     @map("archived_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, jobId, createdAt])
+  @@index([businessId, vehicleId, createdAt])
+  @@map("job_photos")
+}
+
+model Inspection {
+  id                     String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String           @map("business_id") @db.Uuid
+  jobId                  String           @unique @map("job_id") @db.Uuid
+  vehicleId              String           @map("vehicle_id") @db.Uuid
+  customerId             String           @map("customer_id") @db.Uuid
+  technicianMembershipId String?          @map("technician_membership_id") @db.Uuid
+  status                 InspectionStatus @default(IN_PROGRESS)
+  startedAt              DateTime         @default(now()) @map("started_at") @db.Timestamptz(3)
+  completedAt            DateTime?        @map("completed_at") @db.Timestamptz(3)
+  completedById          String?          @map("completed_by_id") @db.Uuid
+  mileageKm              Int?             @map("mileage_km")
+  internalNotes          String?          @map("internal_notes")
+  customerSummary        String?          @map("customer_summary")
+  createdById            String?          @map("created_by_id") @db.Uuid
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  job   JobCard          @relation(fields: [jobId, businessId, vehicleId, customerId], references: [id, businessId, vehicleId, customerId], onDelete: Restrict)
+  items InspectionItem[]
+
+  @@unique([id, businessId])
+  @@index([businessId, vehicleId, completedAt(sort: Desc)])
+  @@map("inspections")
+}
+
+model InspectionItem {
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String               @map("business_id") @db.Uuid
+  inspectionId      String               @map("inspection_id") @db.Uuid
+  category          InspectionCategory
+  itemKey           String               @map("item_key")
+  label             String
+  sortOrder         Int                  @default(0) @map("sort_order")
+  status            InspectionItemStatus @default(NOT_CHECKED)
+  internalNotes     String?              @map("internal_notes")
+  customerNotes     String?              @map("customer_notes")
+  // e.g. tread depth 4.5 mm, tyre pressure 220 kPa. Stored as tenths to stay integer.
+  measurementTenths Int?                 @map("measurement_tenths")
+  measurementUnit   String?              @map("measurement_unit")
+  customerVisible   Boolean              @default(true) @map("customer_visible")
+  updatedById       String?              @map("updated_by_id") @db.Uuid
+  updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  inspection Inspection @relation(fields: [inspectionId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@unique([inspectionId, itemKey])
+  @@index([businessId, inspectionId])
+  @@map("inspection_items")
+}
+
+// Observations and the technician's stated diagnosis are separate fields; a diagnosis is only
+// "confirmed" by an explicit action, never inferred from findings.
+model Diagnosis {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String    @map("business_id") @db.Uuid
+  jobId                  String    @map("job_id") @db.Uuid
+  vehicleId              String    @map("vehicle_id") @db.Uuid
+  customerId             String    @map("customer_id") @db.Uuid
+  technicianMembershipId String?   @map("technician_membership_id") @db.Uuid
+  recordedAt             DateTime  @default(now()) @map("recorded_at") @db.Timestamptz(3)
+  symptoms               String?
+  faultCodes             String[]  @map("fault_codes")
+  testsPerformed         String?   @map("tests_performed")
+  // OBSERVATIONS: what was seen/measured.
+  findings               String?
+  // CONCLUSION: what the technician states is wrong. Empty until they write it.
+  diagnosis              String?
+  confirmedAt            DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  confirmedById          String?   @map("confirmed_by_id") @db.Uuid
+  internalNotes          String?   @map("internal_notes")
+  customerSummary        String?   @map("customer_summary")
+  createdById            String?   @map("created_by_id") @db.Uuid
+  createdAt              DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt             DateTime? @map("archived_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId, vehicleId, customerId], references: [id, businessId, vehicleId, customerId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, vehicleId, recordedAt(sort: Desc)])
+  @@index([businessId, jobId])
+  @@map("diagnoses")
+}
+
+model RecommendedWork {
+  id                     String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String          @map("business_id") @db.Uuid
+  jobId                  String          @map("job_id") @db.Uuid
+  description            String
+  sourceType             WorkSource      @default(MANUAL) @map("source_type")
+  sourceInspectionItemId String?         @map("source_inspection_item_id") @db.Uuid
+  sourceDiagnosisId      String?         @map("source_diagnosis_id") @db.Uuid
+  priority               WorkPriority    @default(RECOMMENDED)
+  quantity               Int             @default(1)
+  partsDescription       String?         @map("parts_description")
+  estimatedMinutes       Int?            @map("estimated_minutes")
+  estimatedLabourCents   Int?            @map("estimated_labour_cents")
+  estimatedPartsCents    Int?            @map("estimated_parts_cents")
+  notes                  String?
+  customerVisible        Boolean         @default(true) @map("customer_visible")
+  approvalStatus         ApprovalStatus  @default(PENDING) @map("approval_status")
+  approvalMethod         ApprovalMethod? @map("approval_method")
+  decidedAt              DateTime?       @map("decided_at") @db.Timestamptz(3)
+  decidedById            String?         @map("decided_by_id") @db.Uuid
+  decisionNote           String?         @map("decision_note")
+  completedAt            DateTime?       @map("completed_at") @db.Timestamptz(3)
+  createdById            String?         @map("created_by_id") @db.Uuid
+  createdAt              DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt             DateTime?       @map("archived_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, jobId])
+  @@map("recommended_work_items")
+}
+
+// Foundation only: Part 5 links these rows to inventory items and manages stock.
+model JobPart {
+  id                String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String     @map("business_id") @db.Uuid
+  jobId             String     @map("job_id") @db.Uuid
+  // The catalogue part this line draws stock from (null = a free-text part that is not stock-tracked).
+  inventoryItemId   String?    @map("inventory_item_id") @db.Uuid
+  stockLocationId   String?    @map("stock_location_id") @db.Uuid
+  reservedAt        DateTime?  @map("reserved_at") @db.Timestamptz(3)
+  fittedAt          DateTime?  @map("fitted_at") @db.Timestamptz(3)
+  fittedById        String?    @map("fitted_by_id") @db.Uuid
+  returnedAt        DateTime?  @map("returned_at") @db.Timestamptz(3)
+  recommendedWorkId String?    @map("recommended_work_id") @db.Uuid
+  description       String
+  partNumber        String?    @map("part_number")
+  quantity          Int        @default(1)
+  costCents         Int?       @map("cost_cents")
+  sellPriceCents    Int?       @map("sell_price_cents")
+  status            PartStatus @default(REQUESTED)
+  addedById         String?    @map("added_by_id") @db.Uuid
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt        DateTime?  @map("archived_at") @db.Timestamptz(3)
+
+  job  JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+  part Part?   @relation(fields: [inventoryItemId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, jobId])
+  @@index([businessId, inventoryItemId, status])
+  @@map("job_parts")
+}
+
+// Foundation only: Part 5 adds time tracking and rate management.
+model JobLabour {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String    @map("business_id") @db.Uuid
+  jobId                  String    @map("job_id") @db.Uuid
+  technicianMembershipId String?   @map("technician_membership_id") @db.Uuid
+  description            String
+  minutes                Int
+  rateCentsPerHour       Int?      @map("rate_cents_per_hour")
+  // minutes x rate / 60, rounded half up, computed on the server.
+  totalCents             Int?      @map("total_cents")
+  recordedById           String?   @map("recorded_by_id") @db.Uuid
+  createdAt              DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  archivedAt             DateTime? @map("archived_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, jobId])
+  @@map("job_labour")
+}
+
+// Append-only: a failed check is kept even when a later one passes.
+model JobQualityCheck {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String   @map("business_id") @db.Uuid
+  jobId       String   @map("job_id") @db.Uuid
+  passed      Boolean
+  checklist   Json
+  reason      String?
+  notes       String?
+  checkedById String?  @map("checked_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  job JobCard @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, jobId, createdAt])
+  @@map("job_quality_checks")
+}
+
+// ───────── Timeline ─────────
+
+// One append-only feed behind the customer, vehicle and job timelines. Every row is written in the
+// same transaction as the change it describes; nothing is synthesised when reading.
+model ActivityEvent {
+  id         String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String     @map("business_id") @db.Uuid
+  type       String
+  customerId String?    @map("customer_id") @db.Uuid
+  vehicleId  String?    @map("vehicle_id") @db.Uuid
+  jobId      String?    @map("job_id") @db.Uuid
+  bookingId  String?    @map("booking_id") @db.Uuid
+  summary    String
+  visibility Visibility @default(INTERNAL)
+  data       Json?
+  actorId    String?    @map("actor_id") @db.Uuid
+  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, customerId, createdAt(sort: Desc)])
+  @@index([businessId, vehicleId, createdAt(sort: Desc)])
+  @@index([businessId, jobId, createdAt(sort: Desc)])
+  @@map("activity_events")
+}
+
+// ═════════════════════════ Part 4: quotes, invoices, payments, credit ═════════════════════════
+// Amounts are integer cents; quantities integer thousandths; rates basis points. Every document stores
+// the VAT facts it was calculated with, and every line stores its own price/cost, so later changes to
+// settings, catalogue prices or labour rates never rewrite history. Totals are computed on the server only.
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  VIEWED
+  APPROVED
+  DECLINED
+  EXPIRED
+  CONVERTED
+  CANCELLED
+
+  @@map("quote_status")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  SENT
+  VIEWED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+  WRITTEN_OFF
+
+  @@map("invoice_status")
+}
+
+enum InvoicePaymentStatus {
+  DRAFT
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+  WRITTEN_OFF
+
+  @@map("invoice_payment_status")
+}
+
+enum FinLineType {
+  PART
+  LABOUR
+  SERVICE
+  CHARGE
+  OTHER
+
+  @@map("fin_line_type")
+}
+
+enum TaxTreatment {
+  STANDARD
+  ZERO_RATED
+  EXEMPT
+
+  @@map("tax_treatment")
+}
+
+enum DiscountType {
+  NONE
+  PERCENT
+  FIXED
+
+  @@map("discount_type")
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+
+  @@map("payment_status")
+}
+
+enum PaymentMethod {
+  CARD
+  EFT
+  CASH
+  ONLINE
+  OTHER
+
+  @@map("payment_method")
+}
+
+enum PaymentPurpose {
+  INVOICE
+  DEPOSIT
+
+  @@map("payment_purpose")
+}
+
+enum CreditNoteStatus {
+  DRAFT
+  ISSUED
+  CANCELLED
+
+  @@map("credit_note_status")
+}
+
+enum CreditEntryKind {
+  DEPOSIT
+  OVERPAYMENT
+  CREDIT_NOTE
+  APPLIED
+  REFUND
+
+  @@map("credit_entry_kind")
+}
+
+enum DocLinkKind {
+  QUOTE
+  INVOICE
+  JOB
+
+  @@map("doc_link_kind")
+}
+
+enum FinNotifyStatus {
+  QUEUED
+  SKIPPED
+  FAILED
+
+  @@map("fin_notify_status")
+}
+
+model FinanceSettings {
+  businessId                    String          @id @map("business_id") @db.Uuid
+  quotePrefix                   String          @default("QUO") @map("quote_prefix")
+  invoicePrefix                 String          @default("INV") @map("invoice_prefix")
+  paymentPrefix                 String          @default("PAY") @map("payment_prefix")
+  receiptPrefix                 String          @default("RCT") @map("receipt_prefix")
+  creditNotePrefix              String          @default("CN") @map("credit_note_prefix")
+  refundPrefix                  String          @default("RFD") @map("refund_prefix")
+  numberPadding                 Int             @default(6) @map("number_padding")
+  quoteValidityDays             Int             @default(14) @map("quote_validity_days")
+  paymentTermsDays              Int             @default(14) @map("payment_terms_days")
+  // true = prices entered on documents already include VAT.
+  pricesIncludeVat              Boolean         @default(false) @map("prices_include_vat")
+  quoteTerms                    String?         @map("quote_terms")
+  invoiceTerms                  String?         @map("invoice_terms")
+  invoiceFooter                 String?         @map("invoice_footer")
+  // Shown to the customer when they pay by EFT or other means (bank, account, branch, reference rule).
+  paymentInstructions           String?         @map("payment_instructions")
+  enabledMethods                PaymentMethod[] @map("enabled_methods")
+  // What an hour of labour is charged at when neither the technician nor the service type has its own rate.
+  defaultLabourRateCentsPerHour Int?            @map("default_labour_rate_cents_per_hour")
+  depositsEnabled               Boolean         @default(true) @map("deposits_enabled")
+  remindersEnabled              Boolean         @default(false) @map("reminders_enabled")
+  // Days relative to the due date: negative = before, 0 = on the day, positive = after.
+  reminderOffsets               Int[]           @map("reminder_offsets")
+  // After the last offset, repeat an overdue reminder every N days (0 = never).
+  reminderRepeatDays            Int             @default(0) @map("reminder_repeat_days")
+  // Online payments: provider key (see finance/providers) and its credentials, encrypted at rest.
+  onlineProvider                String?         @map("online_provider")
+  onlineCredentialsEnc          String?         @map("online_credentials_enc")
+  onlineSandbox                 Boolean         @default(true) @map("online_sandbox")
+  updatedById                   String?         @map("updated_by_id") @db.Uuid
+  updatedAt                     DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("finance_settings")
+}
+
+// ───────── Quotes ─────────
+
+model Quote {
+  id                 String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String      @map("business_id") @db.Uuid
+  number             String
+  customerId         String      @map("customer_id") @db.Uuid
+  vehicleId          String?     @map("vehicle_id") @db.Uuid
+  jobId              String?     @map("job_id") @db.Uuid
+  locationId         String?     @map("location_id") @db.Uuid
+  status             QuoteStatus @default(DRAFT)
+  currentVersion     Int         @default(1) @map("current_version")
+  // Cached from the current version by the service so lists can filter, sort and expire without joining versions.
+  title              String?
+  quoteDate          DateTime?   @map("quote_date") @db.Date
+  validUntil         DateTime?   @map("valid_until") @db.Date
+  totalCents         Int         @default(0) @map("total_cents")
+  // The version the customer approved, once they have.
+  approvedVersion    Int?        @map("approved_version")
+  internalNotes      String?     @map("internal_notes")
+  changesRequestedAt DateTime?   @map("changes_requested_at") @db.Timestamptz(3)
+  approvedAt         DateTime?   @map("approved_at") @db.Timestamptz(3)
+  declinedAt         DateTime?   @map("declined_at") @db.Timestamptz(3)
+  expiredAt          DateTime?   @map("expired_at") @db.Timestamptz(3)
+  cancelledAt        DateTime?   @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason       String?     @map("cancel_reason")
+  jobConvertedAt     DateTime?   @map("job_converted_at") @db.Timestamptz(3)
+  invoicedAt         DateTime?   @map("invoiced_at") @db.Timestamptz(3)
+  createdById        String?     @map("created_by_id") @db.Uuid
+  updatedById        String?     @map("updated_by_id") @db.Uuid
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer Customer       @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  vehicle  Vehicle?       @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+  job      JobCard?       @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+  versions QuoteVersion[]
+  invoices Invoice[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@index([businessId, customerId])
+  @@index([businessId, vehicleId])
+  @@index([businessId, jobId])
+  @@map("quotes")
+}
+
+// One row per version. Content is editable only until the version is sent; afterwards it is frozen and a
+// change creates the next version.
+model QuoteVersion {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String       @map("business_id") @db.Uuid
+  quoteId          String       @map("quote_id") @db.Uuid
+  version          Int
+  title            String?
+  description      String?
+  quoteDate        DateTime     @map("quote_date") @db.Date
+  validUntil       DateTime?    @map("valid_until") @db.Date
+  terms            String?
+  customerNotes    String?      @map("customer_notes")
+  changeNote       String?      @map("change_note")
+  // The tax facts this version was priced with.
+  vatRegistered    Boolean      @map("vat_registered")
+  vatRateBps       Int          @map("vat_rate_bps")
+  pricesIncludeVat Boolean      @map("prices_include_vat")
+  discountType     DiscountType @default(NONE) @map("discount_type")
+  discountValue    Int          @default(0) @map("discount_value")
+  subtotalCents    Int          @default(0) @map("subtotal_cents")
+  discountCents    Int          @default(0) @map("discount_cents")
+  taxableCents     Int          @default(0) @map("taxable_cents")
+  vatCents         Int          @default(0) @map("vat_cents")
+  totalCents       Int          @default(0) @map("total_cents")
+  sentAt           DateTime?    @map("sent_at") @db.Timestamptz(3)
+  sentById         String?      @map("sent_by_id") @db.Uuid
+  createdById      String?      @map("created_by_id") @db.Uuid
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  quote Quote       @relation(fields: [quoteId, businessId], references: [id, businessId], onDelete: Restrict)
+  lines QuoteLine[]
+
+  @@unique([id, businessId])
+  @@unique([quoteId, version])
+  @@index([businessId, quoteId])
+  @@map("quote_versions")
+}
+
+model QuoteLine {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String       @map("business_id") @db.Uuid
+  versionId              String       @map("version_id") @db.Uuid
+  position               Int
+  lineType               FinLineType  @map("line_type")
+  description            String
+  sku                    String?
+  unit                   String?
+  quantityMilli          Int          @map("quantity_milli")
+  unitPriceCents         Int          @map("unit_price_cents")
+  discountType           DiscountType @default(NONE) @map("discount_type")
+  discountValue          Int          @default(0) @map("discount_value")
+  taxTreatment           TaxTreatment @default(STANDARD) @map("tax_treatment")
+  vatRateBps             Int          @default(0) @map("vat_rate_bps")
+  // Calculated by the server (finance/calc.ts):
+  baseCents              Int          @default(0) @map("base_cents")
+  discountCents          Int          @default(0) @map("discount_cents")
+  taxableCents           Int          @default(0) @map("taxable_cents")
+  vatCents               Int          @default(0) @map("vat_cents")
+  totalCents             Int          @default(0) @map("total_cents")
+  // Cost snapshot (per unit) for operational gross profit; never shown to customers.
+  unitCostCents          Int?         @map("unit_cost_cents")
+  inventoryItemId        String?      @map("inventory_item_id") @db.Uuid
+  jobPartId              String?      @map("job_part_id") @db.Uuid
+  jobLabourId            String?      @map("job_labour_id") @db.Uuid
+  recommendedWorkId      String?      @map("recommended_work_id") @db.Uuid
+  technicianMembershipId String?      @map("technician_membership_id") @db.Uuid
+  minutes                Int?
+
+  version QuoteVersion @relation(fields: [versionId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, versionId, position])
+  @@map("quote_lines")
+}
+
+// ───────── Invoices ─────────
+
+model Invoice {
+  id                 String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String               @map("business_id") @db.Uuid
+  // Assigned when the invoice is finalised, so issued numbers have no gaps and are never reused.
+  number             String?
+  customerId         String               @map("customer_id") @db.Uuid
+  vehicleId          String?              @map("vehicle_id") @db.Uuid
+  jobId              String?              @map("job_id") @db.Uuid
+  quoteId            String?              @map("quote_id") @db.Uuid
+  quoteVersion       Int?                 @map("quote_version")
+  locationId         String?              @map("location_id") @db.Uuid
+  status             InvoiceStatus        @default(DRAFT)
+  paymentStatus      InvoicePaymentStatus @default(DRAFT) @map("payment_status")
+  title              String?
+  invoiceDate        DateTime?            @map("invoice_date") @db.Date
+  dueDate            DateTime?            @map("due_date") @db.Date
+  paymentTermsDays   Int                  @default(0) @map("payment_terms_days")
+  terms              String?
+  customerNotes      String?              @map("customer_notes")
+  internalNotes      String?              @map("internal_notes")
+  vatRegistered      Boolean              @map("vat_registered")
+  vatRateBps         Int                  @map("vat_rate_bps")
+  pricesIncludeVat   Boolean              @map("prices_include_vat")
+  discountType       DiscountType         @default(NONE) @map("discount_type")
+  discountValue      Int                  @default(0) @map("discount_value")
+  subtotalCents      Int                  @default(0) @map("subtotal_cents")
+  discountCents      Int                  @default(0) @map("discount_cents")
+  taxableCents       Int                  @default(0) @map("taxable_cents")
+  vatCents           Int                  @default(0) @map("vat_cents")
+  totalCents         Int                  @default(0) @map("total_cents")
+  // Cached from the payment / credit / credit-note / write-off rows by recomputeInvoice(); those rows are the
+  // source of truth and a database CHECK keeps outstanding consistent with them.
+  paidCents          Int                  @default(0) @map("paid_cents")
+  creditAppliedCents Int                  @default(0) @map("credit_applied_cents")
+  creditNotedCents   Int                  @default(0) @map("credit_noted_cents")
+  writtenOffCents    Int                  @default(0) @map("written_off_cents")
+  outstandingCents   Int                  @default(0) @map("outstanding_cents")
+  // Frozen copies of the business and customer details at finalisation, so the PDF never changes retroactively.
+  businessSnapshot   Json?                @map("business_snapshot")
+  customerSnapshot   Json?                @map("customer_snapshot")
+  pdfFileId          String?              @map("pdf_file_id") @db.Uuid
+  finalisedAt        DateTime?            @map("finalised_at") @db.Timestamptz(3)
+  finalisedById      String?              @map("finalised_by_id") @db.Uuid
+  sentAt             DateTime?            @map("sent_at") @db.Timestamptz(3)
+  viewedAt           DateTime?            @map("viewed_at") @db.Timestamptz(3)
+  paidAt             DateTime?            @map("paid_at") @db.Timestamptz(3)
+  cancelledAt        DateTime?            @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason       String?              @map("cancel_reason")
+  writtenOffAt       DateTime?            @map("written_off_at") @db.Timestamptz(3)
+  writeOffReason     String?              @map("write_off_reason")
+  createdById        String?              @map("created_by_id") @db.Uuid
+  updatedById        String?              @map("updated_by_id") @db.Uuid
+  createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business    Business      @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer    Customer      @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  vehicle     Vehicle?      @relation(fields: [vehicleId, businessId], references: [id, businessId], onDelete: Restrict)
+  job         JobCard?      @relation(fields: [jobId, businessId], references: [id, businessId], onDelete: Restrict)
+  quote       Quote?        @relation(fields: [quoteId, businessId], references: [id, businessId], onDelete: Restrict)
+  lines       InvoiceLine[]
+  payments    Payment[]
+  creditNotes CreditNote[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, status, dueDate])
+  @@index([businessId, customerId])
+  @@index([businessId, vehicleId])
+  @@index([businessId, jobId])
+  @@index([businessId, invoiceDate(sort: Desc)])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String       @map("business_id") @db.Uuid
+  invoiceId              String       @map("invoice_id") @db.Uuid
+  position               Int
+  lineType               FinLineType  @map("line_type")
+  description            String
+  sku                    String?
+  unit                   String?
+  quantityMilli          Int          @map("quantity_milli")
+  unitPriceCents         Int          @map("unit_price_cents")
+  discountType           DiscountType @default(NONE) @map("discount_type")
+  discountValue          Int          @default(0) @map("discount_value")
+  taxTreatment           TaxTreatment @default(STANDARD) @map("tax_treatment")
+  vatRateBps             Int          @default(0) @map("vat_rate_bps")
+  baseCents              Int          @default(0) @map("base_cents")
+  discountCents          Int          @default(0) @map("discount_cents")
+  taxableCents           Int          @default(0) @map("taxable_cents")
+  vatCents               Int          @default(0) @map("vat_cents")
+  totalCents             Int          @default(0) @map("total_cents")
+  unitCostCents          Int?         @map("unit_cost_cents")
+  inventoryItemId        String?      @map("inventory_item_id") @db.Uuid
+  jobPartId              String?      @map("job_part_id") @db.Uuid
+  jobLabourId            String?      @map("job_labour_id") @db.Uuid
+  recommendedWorkId      String?      @map("recommended_work_id") @db.Uuid
+  quoteLineId            String?      @map("quote_line_id") @db.Uuid
+  technicianMembershipId String?      @map("technician_membership_id") @db.Uuid
+  minutes                Int?
+
+  invoice Invoice @relation(fields: [invoiceId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, invoiceId, position])
+  @@map("invoice_lines")
+}
+
+// ───────── Payments, refunds, receipts, customer credit ─────────
+
+model Payment {
+  id                   String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId           String         @map("business_id") @db.Uuid
+  number               String
+  invoiceId            String?        @map("invoice_id") @db.Uuid
+  customerId           String         @map("customer_id") @db.Uuid
+  vehicleId            String?        @map("vehicle_id") @db.Uuid
+  jobId                String?        @map("job_id") @db.Uuid
+  quoteId              String?        @map("quote_id") @db.Uuid
+  purpose              PaymentPurpose @default(INVOICE)
+  method               PaymentMethod
+  status               PaymentStatus  @default(COMPLETED)
+  amountCents          Int            @map("amount_cents")
+  // How the amount was split when it completed: part against the invoice, the rest as customer credit.
+  appliedCents         Int            @default(0) @map("applied_cents")
+  creditedCents        Int            @default(0) @map("credited_cents")
+  refundedAppliedCents Int            @default(0) @map("refunded_applied_cents")
+  refundedCreditCents  Int            @default(0) @map("refunded_credit_cents")
+  reference            String?
+  provider             String?
+  providerReference    String?        @map("provider_reference")
+  paidAt               DateTime?      @map("paid_at") @db.Timestamptz(3)
+  notes                String?
+  failureReason        String?        @map("failure_reason")
+  idempotencyKey       String?        @map("idempotency_key")
+  recordedById         String?        @map("recorded_by_id") @db.Uuid
+  reconciledAt         DateTime?      @map("reconciled_at") @db.Timestamptz(3)
+  reconciledById       String?        @map("reconciled_by_id") @db.Uuid
+  reconciliationNote   String?        @map("reconciliation_note")
+  createdAt            DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer Customer @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  invoice  Invoice? @relation(fields: [invoiceId, businessId], references: [id, businessId], onDelete: Restrict)
+  refunds  Refund[]
+  receipt  Receipt?
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, status, paidAt(sort: Desc)])
+  @@index([businessId, invoiceId])
+  @@index([businessId, customerId])
+  @@index([businessId, reference])
+  @@map("payments")
+}
+
+model Refund {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String   @map("business_id") @db.Uuid
+  number            String
+  paymentId         String   @map("payment_id") @db.Uuid
+  invoiceId         String?  @map("invoice_id") @db.Uuid
+  customerId        String   @map("customer_id") @db.Uuid
+  amountCents       Int      @map("amount_cents")
+  fromInvoiceCents  Int      @map("from_invoice_cents")
+  fromCreditCents   Int      @map("from_credit_cents")
+  reason            String
+  providerReference String?  @map("provider_reference")
+  idempotencyKey    String?  @map("idempotency_key")
+  refundedAt        DateTime @default(now()) @map("refunded_at") @db.Timestamptz(3)
+  recordedById      String?  @map("recorded_by_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  payment  Payment  @relation(fields: [paymentId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, paymentId])
+  @@index([businessId, customerId])
+  @@map("refunds")
+}
+
+model Receipt {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String        @map("business_id") @db.Uuid
+  number            String
+  paymentId         String        @map("payment_id") @db.Uuid
+  invoiceId         String?       @map("invoice_id") @db.Uuid
+  customerId        String        @map("customer_id") @db.Uuid
+  amountCents       Int           @map("amount_cents")
+  method            PaymentMethod
+  reference         String?
+  invoiceTotalCents Int?          @map("invoice_total_cents")
+  invoicePaidCents  Int?          @map("invoice_paid_cents")
+  remainingCents    Int?          @map("remaining_cents")
+  fileId            String?       @map("file_id") @db.Uuid
+  issuedAt          DateTime      @default(now()) @map("issued_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  payment  Payment  @relation(fields: [paymentId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([paymentId, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, customerId, issuedAt(sort: Desc)])
+  @@map("receipts")
+}
+
+// Append-only ledger of each customer's credit (deposits, overpayments, credit notes, and their use or refund).
+// The balance is the SUM of amount_cents and a database trigger refuses any entry that would take it below zero.
+model CustomerCreditEntry {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId     String          @map("business_id") @db.Uuid
+  customerId     String          @map("customer_id") @db.Uuid
+  kind           CreditEntryKind
+  // Positive = credit added, negative = credit used or paid out.
+  amountCents    Int             @map("amount_cents")
+  invoiceId      String?         @map("invoice_id") @db.Uuid
+  paymentId      String?         @map("payment_id") @db.Uuid
+  creditNoteId   String?         @map("credit_note_id") @db.Uuid
+  refundId       String?         @map("refund_id") @db.Uuid
+  jobId          String?         @map("job_id") @db.Uuid
+  quoteId        String?         @map("quote_id") @db.Uuid
+  note           String?
+  idempotencyKey String?         @map("idempotency_key")
+  createdById    String?         @map("created_by_id") @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer Customer @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, customerId, createdAt(sort: Desc)])
+  @@index([businessId, invoiceId])
+  @@map("customer_credit_entries")
+}
+
+// ───────── Credit notes ─────────
+
+model CreditNote {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String           @map("business_id") @db.Uuid
+  number           String?
+  invoiceId        String           @map("invoice_id") @db.Uuid
+  customerId       String           @map("customer_id") @db.Uuid
+  vehicleId        String?          @map("vehicle_id") @db.Uuid
+  status           CreditNoteStatus @default(DRAFT)
+  reason           String
+  notes            String?
+  vatRegistered    Boolean          @map("vat_registered")
+  vatRateBps       Int              @map("vat_rate_bps")
+  pricesIncludeVat Boolean          @map("prices_include_vat")
+  subtotalCents    Int              @default(0) @map("subtotal_cents")
+  discountCents    Int              @default(0) @map("discount_cents")
+  taxableCents     Int              @default(0) @map("taxable_cents")
+  vatCents         Int              @default(0) @map("vat_cents")
+  totalCents       Int              @default(0) @map("total_cents")
+  // On issue: the part that reduced the invoice, and the part that became customer credit.
+  appliedCents     Int              @default(0) @map("applied_cents")
+  creditedCents    Int              @default(0) @map("credited_cents")
+  issuedAt         DateTime?        @map("issued_at") @db.Timestamptz(3)
+  authorisedById   String?          @map("authorised_by_id") @db.Uuid
+  cancelledAt      DateTime?        @map("cancelled_at") @db.Timestamptz(3)
+  createdById      String?          @map("created_by_id") @db.Uuid
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business         @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  customer Customer         @relation(fields: [customerId, businessId], references: [id, businessId], onDelete: Restrict)
+  invoice  Invoice          @relation(fields: [invoiceId, businessId], references: [id, businessId], onDelete: Restrict)
+  lines    CreditNoteLine[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, invoiceId])
+  @@index([businessId, customerId])
+  @@map("credit_notes")
+}
+
+model CreditNoteLine {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId     String       @map("business_id") @db.Uuid
+  creditNoteId   String       @map("credit_note_id") @db.Uuid
+  position       Int
+  lineType       FinLineType  @map("line_type")
+  description    String
+  sku            String?
+  unit           String?
+  quantityMilli  Int          @map("quantity_milli")
+  unitPriceCents Int          @map("unit_price_cents")
+  discountType   DiscountType @default(NONE) @map("discount_type")
+  discountValue  Int          @default(0) @map("discount_value")
+  taxTreatment   TaxTreatment @default(STANDARD) @map("tax_treatment")
+  vatRateBps     Int          @default(0) @map("vat_rate_bps")
+  baseCents      Int          @default(0) @map("base_cents")
+  discountCents  Int          @default(0) @map("discount_cents")
+  taxableCents   Int          @default(0) @map("taxable_cents")
+  vatCents       Int          @default(0) @map("vat_cents")
+  totalCents     Int          @default(0) @map("total_cents")
+  unitCostCents  Int?         @map("unit_cost_cents")
+
+  creditNote CreditNote @relation(fields: [creditNoteId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, creditNoteId, position])
+  @@map("credit_note_lines")
+}
+
+// ───────── Events, links, notification log ─────────
+
+// Append-only history of every significant action on a quote, invoice, payment or credit note, including
+// what the customer did through a link (and how: IP, device).
+model FinanceEvent {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String   @map("business_id") @db.Uuid
+  entityType  String   @map("entity_type")
+  entityId    String   @map("entity_id") @db.Uuid
+  version     Int?
+  type        String
+  // STAFF, CUSTOMER or SYSTEM.
+  actorKind   String   @map("actor_kind")
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  actorName   String?  @map("actor_name")
+  ip          String?
+  userAgent   String?  @map("user_agent")
+  detail      Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, entityType, entityId, createdAt])
+  @@map("finance_events")
+}
+
+// A secret link that lets a customer open one quote or invoice without signing in. Only the hash is stored.
+model DocumentLink {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String      @map("business_id") @db.Uuid
+  kind         DocLinkKind
+  documentId   String      @map("document_id") @db.Uuid
+  tokenHash    String      @unique @map("token_hash")
+  expiresAt    DateTime    @map("expires_at") @db.Timestamptz(3)
+  revokedAt    DateTime?   @map("revoked_at") @db.Timestamptz(3)
+  createdById  String?     @map("created_by_id") @db.Uuid
+  lastViewedAt DateTime?   @map("last_viewed_at") @db.Timestamptz(3)
+  viewCount    Int         @default(0) @map("view_count")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, kind, documentId])
+  @@map("document_links")
+}
+
+// What the system tried to tell a customer about money, and what happened. dedupe_key makes a retried job or a
+// repeated scheduler tick unable to send the same message twice.
+model FinanceNotification {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String          @map("business_id") @db.Uuid
+  customerId      String?         @map("customer_id") @db.Uuid
+  entityType      String          @map("entity_type")
+  entityId        String          @map("entity_id") @db.Uuid
+  kind            String
+  channel         String          @default("EMAIL")
+  recipient       String?
+  status          FinNotifyStatus @default(QUEUED)
+  detail          String?
+  templateKey     String          @map("template_key")
+  templateVersion Int             @default(1) @map("template_version")
+  dedupeKey       String          @map("dedupe_key")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId, entityType, entityId])
+  @@map("finance_notifications")
+}
+
+// ═════════════════════════ Part 5: inventory, suppliers, purchasing, team ═════════════════════════
+
+enum InventoryStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+
+  @@map("inventory_status")
+}
+
+enum StockMovementType {
+  RECEIVED
+  SOLD
+  USED
+  RESERVED
+  UNRESERVED
+  RETURNED
+  ADJUSTED
+  DAMAGED
+  LOST
+  TRANSFER_IN
+  TRANSFER_OUT
+  SUPPLIER_RETURN
+
+  @@map("stock_movement_type")
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  ORDERED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+
+  @@map("purchase_order_status")
+}
+
+enum TransferStatus {
+  DRAFT
+  REQUESTED
+  APPROVED
+  IN_TRANSIT
+  RECEIVED
+  CANCELLED
+
+  @@map("transfer_status")
+}
+
+enum CostMethod {
+  LAST_COST
+  AVERAGE_COST
+
+  @@map("cost_method")
+}
+
+enum TechnicianStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("technician_status")
+}
+
+enum TimeEntryStatus {
+  RUNNING
+  COMPLETED
+  VOIDED
+
+  @@map("time_entry_status")
+}
+
+enum TimeEntrySource {
+  TIMER
+  MANUAL
+
+  @@map("time_entry_source")
+}
+
+// One row per business: how stock, purchasing and numbering behave.
+model InventorySettings {
+  businessId               String     @id @map("business_id") @db.Uuid
+  uniqueSku                Boolean    @default(true) @map("unique_sku")
+  uniquePartNumber         Boolean    @default(false) @map("unique_part_number")
+  uniqueBarcode            Boolean    @default(true) @map("unique_barcode")
+  // Off by default. When on, stock may be used below zero; every such movement is flagged and audited.
+  allowNegativeStock       Boolean    @default(false) @map("allow_negative_stock")
+  // Reserve stock as soon as a catalogue part is added to a job (when there is enough).
+  autoReserveOnJobAdd      Boolean    @default(true) @map("auto_reserve_on_job_add")
+  costMethod               CostMethod @default(LAST_COST) @map("cost_method")
+  poPrefix                 String     @default("PO") @map("po_prefix")
+  receiptPrefix            String     @default("GRN") @map("receipt_prefix")
+  transferPrefix           String     @default("TRF") @map("transfer_prefix")
+  supplierReturnPrefix     String     @default("SRT") @map("supplier_return_prefix")
+  numberPadding            Int        @default(6) @map("number_padding")
+  poApprovalRequired       Boolean    @default(false) @map("po_approval_required")
+  // When approval is required: only orders at or above this total need it (0 = all orders).
+  poApprovalThresholdCents Int        @default(0) @map("po_approval_threshold_cents")
+  transferApprovalRequired Boolean    @default(false) @map("transfer_approval_required")
+  // Days after the expected delivery date before an open order is flagged as late.
+  poReminderDays           Int        @default(1) @map("po_reminder_days")
+  updatedById              String?    @map("updated_by_id") @db.Uuid
+  updatedAt                DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("inventory_settings")
+}
+
+model PartCategory {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String       @map("business_id") @db.Uuid
+  name        String
+  parentId    String?      @map("parent_id") @db.Uuid
+  sortOrder   Int          @default(0) @map("sort_order")
+  status      RecordStatus @default(ACTIVE)
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  parts Part[]
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("part_categories")
+}
+
+model Supplier {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String          @map("business_id") @db.Uuid
+  name               String
+  tradingName        String?         @map("trading_name")
+  contactPerson      String?         @map("contact_person")
+  phone              String?
+  email              String?
+  address            String?
+  vatNumber          String?         @map("vat_number")
+  registrationNumber String?         @map("registration_number")
+  accountNumber      String?         @map("account_number")
+  paymentTerms       String?         @map("payment_terms")
+  notes              String?
+  status             InventoryStatus @default(ACTIVE)
+  createdById        String?         @map("created_by_id") @db.Uuid
+  updatedById        String?         @map("updated_by_id") @db.Uuid
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  parts         Part[]
+  partSuppliers PartSupplier[]
+  orders        PurchaseOrder[]
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("suppliers")
+}
+
+model Part {
+  id                String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String          @map("business_id") @db.Uuid
+  sku               String
+  partNumber        String?         @map("part_number")
+  name              String
+  description       String?
+  categoryId        String?         @map("category_id") @db.Uuid
+  brand             String?
+  manufacturer      String?
+  barcode           String?
+  unit              String          @default("each")
+  // What one unit costs the business (cost basis per the business's cost method). Null = not known.
+  costCents         Int?            @map("cost_cents")
+  sellPriceCents    Int?            @map("sell_price_cents")
+  taxTreatment      TaxTreatment    @default(STANDARD) @map("tax_treatment")
+  minStock          Int             @default(0) @map("min_stock")
+  reorderLevel      Int?            @map("reorder_level")
+  reorderQuantity   Int?            @map("reorder_quantity")
+  primarySupplierId String?         @map("primary_supplier_id") @db.Uuid
+  status            InventoryStatus @default(ACTIVE)
+  notes             String?
+  // The level last announced to staff, so a part that stays low is announced once, not every run.
+  lastAlertLevel    String          @default("NORMAL") @map("last_alert_level")
+  createdById       String?         @map("created_by_id") @db.Uuid
+  updatedById       String?         @map("updated_by_id") @db.Uuid
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt        DateTime?       @map("archived_at") @db.Timestamptz(3)
+
+  category        PartCategory?       @relation(fields: [categoryId, businessId], references: [id, businessId], onDelete: Restrict)
+  primarySupplier Supplier?           @relation(fields: [primarySupplierId, businessId], references: [id, businessId], onDelete: Restrict)
+  levels          StockLevel[]
+  movements       StockMovement[]
+  compatibility   PartCompatibility[]
+  suppliers       PartSupplier[]
+  prices          PartPriceHistory[]
+  jobParts        JobPart[]
+  poLines         PurchaseOrderLine[]
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@index([businessId, categoryId])
+  @@index([businessId, primarySupplierId])
+  @@index([businessId, barcode])
+  @@map("parts")
+}
+
+model PartCompatibility {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String        @map("business_id") @db.Uuid
+  partId       String        @map("part_id") @db.Uuid
+  make         String?
+  model        String?
+  yearFrom     Int?          @map("year_from")
+  yearTo       Int?          @map("year_to")
+  variant      String?
+  engine       String?
+  engineSizeCc Int?          @map("engine_size_cc")
+  fuelType     FuelType?     @map("fuel_type")
+  transmission Transmission?
+  notes        String?
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  part Part @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, partId])
+  @@index([businessId, make, model])
+  @@map("part_compatibility")
+}
+
+model PartSupplier {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String          @map("business_id") @db.Uuid
+  partId             String          @map("part_id") @db.Uuid
+  supplierId         String          @map("supplier_id") @db.Uuid
+  supplierPartNumber String?         @map("supplier_part_number")
+  // The supplier's current quoted cost. Purchases keep the price actually paid; this never rewrites them.
+  supplierCostCents  Int?            @map("supplier_cost_cents")
+  leadTimeDays       Int?            @map("lead_time_days")
+  preferred          Boolean         @default(false)
+  status             InventoryStatus @default(ACTIVE)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  part     Part     @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+  supplier Supplier @relation(fields: [supplierId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([partId, supplierId])
+  @@index([businessId, supplierId])
+  @@map("part_suppliers")
+}
+
+// Append-only history of cost and selling price changes.
+model PartPriceHistory {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String   @map("business_id") @db.Uuid
+  partId            String   @map("part_id") @db.Uuid
+  previousCostCents Int?     @map("previous_cost_cents")
+  newCostCents      Int?     @map("new_cost_cents")
+  previousSellCents Int?     @map("previous_sell_cents")
+  newSellCents      Int?     @map("new_sell_cents")
+  source            String
+  reason            String?
+  changedById       String?  @map("changed_by_id") @db.Uuid
+  changedAt         DateTime @default(now()) @map("changed_at") @db.Timestamptz(3)
+
+  part Part @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, partId, changedAt(sort: Desc)])
+  @@map("part_price_history")
+}
+
+// How many of a part are at one location. Quantities change ONLY through stock movements (a trigger applies each
+// movement and refuses any other change), so the count can never drift from its history.
+model StockLevel {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String   @map("business_id") @db.Uuid
+  partId      String   @map("part_id") @db.Uuid
+  locationId  String   @map("location_id") @db.Uuid
+  onHand      Int      @default(0) @map("on_hand")
+  reserved    Int      @default(0)
+  storageArea String?  @map("storage_area")
+  bin         String?
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  part Part @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([partId, locationId])
+  @@index([businessId, locationId])
+  @@index([businessId, partId])
+  @@map("stock_levels")
+}
+
+// Immutable ledger. The before/after figures are filled in by the database under the stock row's lock.
+model StockMovement {
+  id              String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String            @map("business_id") @db.Uuid
+  partId          String            @map("part_id") @db.Uuid
+  locationId      String            @map("location_id") @db.Uuid
+  type            StockMovementType
+  // Signed changes to the two counters.
+  onHandDelta     Int               @map("on_hand_delta")
+  reservedDelta   Int               @default(0) @map("reserved_delta")
+  onHandBefore    Int               @default(0) @map("on_hand_before")
+  onHandAfter     Int               @default(0) @map("on_hand_after")
+  reservedBefore  Int               @default(0) @map("reserved_before")
+  reservedAfter   Int               @default(0) @map("reserved_after")
+  // What one unit cost at the time (kept for valuation and margin history).
+  unitCostCents   Int?              @map("unit_cost_cents")
+  referenceType   String?           @map("reference_type")
+  referenceId     String?           @map("reference_id") @db.Uuid
+  jobId           String?           @map("job_id") @db.Uuid
+  jobPartId       String?           @map("job_part_id") @db.Uuid
+  invoiceId       String?           @map("invoice_id") @db.Uuid
+  purchaseOrderId String?           @map("purchase_order_id") @db.Uuid
+  receiptId       String?           @map("receipt_id") @db.Uuid
+  transferId      String?           @map("transfer_id") @db.Uuid
+  reasonCode      String?           @map("reason_code")
+  reason          String?
+  wentNegative    Boolean           @default(false) @map("went_negative")
+  idempotencyKey  String?           @map("idempotency_key")
+  createdById     String?           @map("created_by_id") @db.Uuid
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  part Part @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, partId, createdAt(sort: Desc)])
+  @@index([businessId, locationId, type, createdAt(sort: Desc)])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@index([businessId, referenceType, referenceId])
+  @@index([businessId, jobId])
+  @@map("stock_movements")
+}
+
+model PurchaseOrder {
+  id                String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String              @map("business_id") @db.Uuid
+  number            String
+  supplierId        String              @map("supplier_id") @db.Uuid
+  locationId        String              @map("location_id") @db.Uuid
+  status            PurchaseOrderStatus @default(DRAFT)
+  poDate            DateTime            @map("po_date") @db.Date
+  expectedDate      DateTime?           @map("expected_date") @db.Date
+  notes             String?
+  internalNotes     String?             @map("internal_notes")
+  terms             String?
+  vatRegistered     Boolean             @default(false) @map("vat_registered")
+  vatRateBps        Int                 @default(0) @map("vat_rate_bps")
+  subtotalCents     Int                 @default(0) @map("subtotal_cents")
+  vatCents          Int                 @default(0) @map("vat_cents")
+  totalCents        Int                 @default(0) @map("total_cents")
+  requiresApproval  Boolean             @default(false) @map("requires_approval")
+  submittedAt       DateTime?           @map("submitted_at") @db.Timestamptz(3)
+  approvedById      String?             @map("approved_by_id") @db.Uuid
+  approvedAt        DateTime?           @map("approved_at") @db.Timestamptz(3)
+  rejectedReason    String?             @map("rejected_reason")
+  orderedAt         DateTime?           @map("ordered_at") @db.Timestamptz(3)
+  orderedById       String?             @map("ordered_by_id") @db.Uuid
+  sentToSupplierAt  DateTime?           @map("sent_to_supplier_at") @db.Timestamptz(3)
+  closedAt          DateTime?           @map("closed_at") @db.Timestamptz(3)
+  closedShort       Boolean             @default(false) @map("closed_short")
+  cancelledAt       DateTime?           @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason      String?             @map("cancel_reason")
+  lastLateNoticeFor DateTime?           @map("last_late_notice_for") @db.Date
+  createdById       String?             @map("created_by_id") @db.Uuid
+  updatedById       String?             @map("updated_by_id") @db.Uuid
+  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  supplier Supplier            @relation(fields: [supplierId, businessId], references: [id, businessId], onDelete: Restrict)
+  lines    PurchaseOrderLine[]
+  receipts GoodsReceipt[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@index([businessId, supplierId])
+  @@index([businessId, locationId])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id                 String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId         String       @map("business_id") @db.Uuid
+  purchaseOrderId    String       @map("purchase_order_id") @db.Uuid
+  position           Int
+  partId             String?      @map("part_id") @db.Uuid
+  description        String
+  supplierPartNumber String?      @map("supplier_part_number")
+  quantityOrdered    Int          @map("quantity_ordered")
+  quantityReceived   Int          @default(0) @map("quantity_received")
+  // Units the business has decided not to wait for (closed short). Remaining = ordered - received - cancelled.
+  quantityCancelled  Int          @default(0) @map("quantity_cancelled")
+  quantityDamaged    Int          @default(0) @map("quantity_damaged")
+  unitCostCents      Int          @map("unit_cost_cents")
+  taxTreatment       TaxTreatment @default(STANDARD) @map("tax_treatment")
+  vatRateBps         Int          @default(0) @map("vat_rate_bps")
+  subtotalCents      Int          @default(0) @map("subtotal_cents")
+  vatCents           Int          @default(0) @map("vat_cents")
+  totalCents         Int          @default(0) @map("total_cents")
+
+  order PurchaseOrder @relation(fields: [purchaseOrderId, businessId], references: [id, businessId], onDelete: Restrict)
+  part  Part?         @relation(fields: [partId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, purchaseOrderId, position])
+  @@index([businessId, partId])
+  @@map("purchase_order_lines")
+}
+
+// One delivery. Immutable once saved; a mistake is corrected by a supplier return or an adjustment.
+model GoodsReceipt {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String   @map("business_id") @db.Uuid
+  number          String
+  purchaseOrderId String   @map("purchase_order_id") @db.Uuid
+  supplierId      String   @map("supplier_id") @db.Uuid
+  locationId      String   @map("location_id") @db.Uuid
+  deliveryNoteRef String?  @map("delivery_note_ref")
+  notes           String?
+  idempotencyKey  String?  @map("idempotency_key")
+  receivedById    String?  @map("received_by_id") @db.Uuid
+  receivedAt      DateTime @default(now()) @map("received_at") @db.Timestamptz(3)
+
+  order PurchaseOrder      @relation(fields: [purchaseOrderId, businessId], references: [id, businessId], onDelete: Restrict)
+  lines GoodsReceiptLine[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, purchaseOrderId])
+  @@index([businessId, supplierId, receivedAt(sort: Desc)])
+  @@map("goods_receipts")
+}
+
+model GoodsReceiptLine {
+  id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String  @map("business_id") @db.Uuid
+  receiptId         String  @map("receipt_id") @db.Uuid
+  poLineId          String  @map("po_line_id") @db.Uuid
+  partId            String? @map("part_id") @db.Uuid
+  description       String
+  // How many were still outstanding when the delivery arrived.
+  quantityExpected  Int     @map("quantity_expected")
+  quantityReceived  Int     @map("quantity_received")
+  quantityDamaged   Int     @default(0) @map("quantity_damaged")
+  quantityIncorrect Int     @default(0) @map("quantity_incorrect")
+  quantityMissing   Int     @default(0) @map("quantity_missing")
+  // The price actually paid per unit for this delivery.
+  unitCostCents     Int     @map("unit_cost_cents")
+  vatCents          Int     @default(0) @map("vat_cents")
+  // How many of the accepted units have since gone back to the supplier (maintained with the return).
+  quantityReturned  Int     @default(0) @map("quantity_returned")
+  notes             String?
+
+  receipt GoodsReceipt @relation(fields: [receiptId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, receiptId])
+  @@index([businessId, partId])
+  @@map("goods_receipt_lines")
+}
+
+model SupplierReturn {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String   @map("business_id") @db.Uuid
+  number          String
+  supplierId      String   @map("supplier_id") @db.Uuid
+  locationId      String   @map("location_id") @db.Uuid
+  receiptId       String?  @map("receipt_id") @db.Uuid
+  purchaseOrderId String?  @map("purchase_order_id") @db.Uuid
+  reason          String
+  notes           String?
+  idempotencyKey  String?  @map("idempotency_key")
+  createdById     String?  @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  lines SupplierReturnLine[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, supplierId, createdAt(sort: Desc)])
+  @@map("supplier_returns")
+}
+
+model SupplierReturnLine {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String  @map("business_id") @db.Uuid
+  returnId      String  @map("return_id") @db.Uuid
+  partId        String  @map("part_id") @db.Uuid
+  receiptLineId String? @map("receipt_line_id") @db.Uuid
+  quantity      Int
+  unitCostCents Int?    @map("unit_cost_cents")
+  reason        String?
+
+  supplierReturn SupplierReturn @relation(fields: [returnId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@index([businessId, returnId])
+  @@index([businessId, partId])
+  @@map("supplier_return_lines")
+}
+
+model StockTransfer {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId     String         @map("business_id") @db.Uuid
+  number         String
+  fromLocationId String         @map("from_location_id") @db.Uuid
+  toLocationId   String         @map("to_location_id") @db.Uuid
+  status         TransferStatus @default(DRAFT)
+  notes          String?
+  requestedById  String?        @map("requested_by_id") @db.Uuid
+  requestedAt    DateTime?      @map("requested_at") @db.Timestamptz(3)
+  approvedById   String?        @map("approved_by_id") @db.Uuid
+  approvedAt     DateTime?      @map("approved_at") @db.Timestamptz(3)
+  shippedById    String?        @map("shipped_by_id") @db.Uuid
+  shippedAt      DateTime?      @map("shipped_at") @db.Timestamptz(3)
+  receivedById   String?        @map("received_by_id") @db.Uuid
+  receivedAt     DateTime?      @map("received_at") @db.Timestamptz(3)
+  cancelledAt    DateTime?      @map("cancelled_at") @db.Timestamptz(3)
+  cancelReason   String?        @map("cancel_reason")
+  createdById    String?        @map("created_by_id") @db.Uuid
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  lines StockTransferLine[]
+
+  @@unique([id, businessId])
+  @@unique([businessId, number])
+  @@index([businessId, status])
+  @@map("stock_transfers")
+}
+
+model StockTransferLine {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String @map("business_id") @db.Uuid
+  transferId    String @map("transfer_id") @db.Uuid
+  partId        String @map("part_id") @db.Uuid
+  quantity      Int
+  unitCostCents Int?   @map("unit_cost_cents")
+
+  transfer StockTransfer @relation(fields: [transferId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([transferId, partId])
+  @@index([businessId, transferId])
+  @@map("stock_transfer_lines")
+}
+
+// ───────── Team: technicians, assignment history, time ─────────
+
+// Marks a member as a technician (or not) and holds the technician-specific settings. Members with no row
+// follow the Part 3 default: anyone whose role may edit jobs can be assigned to them.
+model TechnicianProfile {
+  id                       String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId               String           @map("business_id") @db.Uuid
+  membershipId             String           @map("membership_id") @db.Uuid
+  isTechnician             Boolean          @default(true) @map("is_technician")
+  status                   TechnicianStatus @default(ACTIVE)
+  // What the customer is charged per hour for this person's time (overrides the service and business rates).
+  billableRateCentsPerHour Int?             @map("billable_rate_cents_per_hour")
+  skills                   String[]
+  notes                    String?
+  deactivatedAt            DateTime?        @map("deactivated_at") @db.Timestamptz(3)
+  updatedById              String?          @map("updated_by_id") @db.Uuid
+  createdAt                DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  serviceTypes TechnicianServiceType[]
+
+  @@unique([membershipId])
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("technician_profiles")
+}
+
+model TechnicianServiceType {
+  technicianId  String @map("technician_id") @db.Uuid
+  serviceTypeId String @map("service_type_id") @db.Uuid
+  businessId    String @map("business_id") @db.Uuid
+
+  technician TechnicianProfile @relation(fields: [technicianId], references: [id], onDelete: Cascade)
+
+  @@id([technicianId, serviceTypeId])
+  @@map("technician_service_types")
+}
+
+// Append-only record of who was put on / taken off a job, by whom, and when.
+model JobAssignmentEvent {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String   @map("business_id") @db.Uuid
+  jobId        String   @map("job_id") @db.Uuid
+  membershipId String   @map("membership_id") @db.Uuid
+  // PRIMARY_ASSIGNED, PRIMARY_REMOVED, ADDED, REMOVED
+  action       String
+  byUserId     String?  @map("by_user_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, jobId, createdAt])
+  @@index([businessId, membershipId, createdAt(sort: Desc)])
+  @@map("job_assignment_events")
+}
+
+model TimeEntry {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String          @map("business_id") @db.Uuid
+  membershipId    String          @map("membership_id") @db.Uuid
+  jobId           String          @map("job_id") @db.Uuid
+  status          TimeEntryStatus
+  source          TimeEntrySource
+  startedAt       DateTime        @map("started_at") @db.Timestamptz(3)
+  endedAt         DateTime?       @map("ended_at") @db.Timestamptz(3)
+  durationMinutes Int?            @map("duration_minutes")
+  billable        Boolean         @default(true)
+  notes           String?
+  // Set once the time has been turned into a labour line on the job (the rate in force is copied there).
+  jobLabourId     String?         @map("job_labour_id") @db.Uuid
+  postedAt        DateTime?       @map("posted_at") @db.Timestamptz(3)
+  idempotencyKey  String?         @map("idempotency_key")
+  editCount       Int             @default(0) @map("edit_count")
+  approvedById    String?         @map("approved_by_id") @db.Uuid
+  approvedAt      DateTime?       @map("approved_at") @db.Timestamptz(3)
+  voidedAt        DateTime?       @map("voided_at") @db.Timestamptz(3)
+  voidedById      String?         @map("voided_by_id") @db.Uuid
+  voidReason      String?         @map("void_reason")
+  createdById     String?         @map("created_by_id") @db.Uuid
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([id, businessId])
+  @@index([businessId, membershipId, startedAt(sort: Desc)])
+  @@index([businessId, jobId])
+  @@index([businessId, status])
+  @@map("time_entries")
+}
+
+// ═════════════════════════ Part 6: documents, photos, notifications ═════════════════════════
+
+enum DocumentVisibility {
+  INTERNAL
+  CUSTOMER
+  RESTRICTED
+
+  @@map("document_visibility")
+}
+
+enum FileSource {
+  UPLOAD
+  GENERATED
+
+  @@map("file_source")
+}
+
+enum ScanStatus {
+  NOT_SCANNED
+  PENDING
+  CLEAN
+  FLAGGED
+
+  @@map("scan_status")
+}
+
+enum GenerationStatus {
+  QUEUED
+  DONE
+  FAILED
+
+  @@map("generation_status")
+}
+
+enum CommChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+
+  @@map("comm_channel")
+}
+
+enum CommStatus {
+  QUEUED
+  PROCESSING
+  SENT
+  DELIVERED
+  VIEWED
+  FAILED
+  CANCELLED
+  SKIPPED
+
+  @@map("comm_status")
+}
+
+enum ConsentStatus {
+  GRANTED
+  WITHDRAWN
+
+  @@map("consent_status")
+}
+
+model DocumentCategory {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String   @map("business_id") @db.Uuid
+  key        String
+  label      String
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([businessId, key])
+  @@map("document_categories")
+}
+
+model DocumentSettings {
+  businessId         String   @id @map("business_id") @db.Uuid
+  trashRetentionDays Int      @default(30) @map("trash_retention_days")
+  financialRetention Int      @default(5) @map("financial_retention_years")
+  maxUploadMb        Int?     @map("max_upload_mb")
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("document_settings")
+}
+
+// One row per request to generate a business document (PDF). The file only exists once the object is really stored.
+model DocumentGeneration {
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String           @map("business_id") @db.Uuid
+  kind          String
+  entityId      String           @map("entity_id") @db.Uuid
+  status        GenerationStatus @default(QUEUED)
+  fileId        String?          @map("file_id") @db.Uuid
+  requestedById String?          @map("requested_by_id") @db.Uuid
+  attempts      Int              @default(0)
+  lastError     String?          @map("last_error")
+  dedupeKey     String           @map("dedupe_key")
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt   DateTime?        @map("completed_at") @db.Timestamptz(3)
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId, kind, entityId])
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@map("document_generations")
+}
+
+// Every operational message to a customer (or supplier): what, to whom, about which record, and what happened.
+model Communication {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String      @map("business_id") @db.Uuid
+  customerId      String?     @map("customer_id") @db.Uuid
+  channel         CommChannel
+  event           String
+  category        String
+  transactional   Boolean     @default(true)
+  recipient       String?
+  subject         String?
+  body            String
+  entityType      String?     @map("entity_type")
+  entityId        String?     @map("entity_id") @db.Uuid
+  locationId      String?     @map("location_id") @db.Uuid
+  status          CommStatus  @default(QUEUED)
+  statusDetail    String?     @map("status_detail")
+  provider        String?
+  providerRef     String?     @map("provider_ref")
+  attempts        Int         @default(0)
+  templateKey     String      @map("template_key")
+  templateVersion Int         @default(1) @map("template_version")
+  dedupeKey       String      @map("dedupe_key")
+  manual          Boolean     @default(false)
+  createdById     String?     @map("created_by_id") @db.Uuid
+  queuedAt        DateTime    @default(now()) @map("queued_at") @db.Timestamptz(3)
+  sentAt          DateTime?   @map("sent_at") @db.Timestamptz(3)
+  deliveredAt     DateTime?   @map("delivered_at") @db.Timestamptz(3)
+  viewedAt        DateTime?   @map("viewed_at") @db.Timestamptz(3)
+  failedAt        DateTime?   @map("failed_at") @db.Timestamptz(3)
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@index([businessId, customerId, createdAt(sort: Desc)])
+  @@index([businessId, entityType, entityId])
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@index([businessId, channel, event])
+  @@index([businessId, recipient])
+  @@index([channel, providerRef])
+  @@map("communications")
+}
+
+model MessageTemplate {
+  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String      @map("business_id") @db.Uuid
+  event       String
+  channel     CommChannel
+  subject     String?
+  body        String
+  active      Boolean     @default(true)
+  version     Int         @default(1)
+  updatedById String?     @map("updated_by_id") @db.Uuid
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([businessId, event, channel])
+  @@map("message_templates")
+}
+
+model CommunicationSettings {
+  businessId           String   @id @map("business_id") @db.Uuid
+  senderName           String?  @map("sender_name")
+  replyTo              String?  @map("reply_to")
+  signature            String?
+  smsEnabled           Boolean  @default(false) @map("sms_enabled")
+  whatsappEnabled      Boolean  @default(false) @map("whatsapp_enabled")
+  // Customer-facing job updates the business wants sent (event keys); empty = none.
+  jobUpdateEvents      String[] @default([]) @map("job_update_events")
+  bookingReminderHours Int      @default(24) @map("booking_reminder_hours")
+  serviceReminderDays  Int      @default(14) @map("service_reminder_days")
+  serviceReminderKm    Int      @default(1000) @map("service_reminder_km")
+  serviceRemindersOn   Boolean  @default(false) @map("service_reminders_on")
+  bookingRemindersOn   Boolean  @default(true) @map("booking_reminders_on")
+  maxPerHour           Int      @default(300) @map("max_per_hour")
+  // Who is told about internal events: { EVENT_KEY: { enabled, permission, inApp, email } }
+  internalRules        Json     @default("{}") @map("internal_rules")
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("communication_settings")
+}
+
+model CustomerCommPreference {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String       @map("business_id") @db.Uuid
+  customerId       String       @map("customer_id") @db.Uuid
+  preferredChannel CommChannel? @map("preferred_channel")
+  bookingReminders Boolean      @default(true) @map("booking_reminders")
+  jobUpdates       Boolean      @default(true) @map("job_updates")
+  paymentReminders Boolean      @default(true) @map("payment_reminders")
+  serviceReminders Boolean      @default(true) @map("service_reminders")
+  smsOk            Boolean      @default(false) @map("sms_ok")
+  whatsappOk       Boolean      @default(false) @map("whatsapp_ok")
+  updatedAt        DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([businessId, customerId])
+  @@map("customer_comm_preferences")
+}
+
+// Append-only history of consent being given or withdrawn.
+model ConsentRecord {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String        @map("business_id") @db.Uuid
+  customerId  String        @map("customer_id") @db.Uuid
+  consentType String        @map("consent_type")
+  status      ConsentStatus
+  source      String
+  version     Int           @default(1)
+  changedById String?       @map("changed_by_id") @db.Uuid
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([businessId, customerId, consentType, createdAt(sort: Desc)])
+  @@map("consent_records")
+}
+
+// A service reminder that was sent (or deliberately skipped) for one due point of one schedule; the unique key stops repeats.
+model ServiceReminderLog {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String   @map("business_id") @db.Uuid
+  vehicleId       String   @map("vehicle_id") @db.Uuid
+  intervalId      String   @map("interval_id") @db.Uuid
+  customerId      String?  @map("customer_id") @db.Uuid
+  dueKey          String   @map("due_key")
+  outcome         String
+  detail          String?
+  communicationId String?  @map("communication_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([intervalId, dueKey])
+  @@index([businessId, vehicleId, createdAt(sort: Desc)])
+  @@map("service_reminder_log")
+}
+
+// ═════════════════════════ Part 7: reports, settings, imports, administration ═════════════════════════
+
+// One row per business (loaded with an upsert, so a business that predates Part 7 gets the defaults).
+model BusinessConfig {
+  businessId             String   @id @map("business_id") @db.Uuid
+  customerPrefix         String   @default("CUS") @map("customer_prefix")
+  bookingPrefix          String   @default("BKG") @map("booking_prefix")
+  jobPrefix              String   @default("JOB") @map("job_prefix")
+  customerPadding        Int      @default(6) @map("customer_padding")
+  bookingPadding         Int      @default(6) @map("booking_padding")
+  jobPadding             Int      @default(7) @map("job_padding")
+  minBillableMinutes     Int      @default(0) @map("min_billable_minutes")
+  timeRoundingMinutes    Int      @default(0) @map("time_rounding_minutes")
+  timeRoundingMode       String   @default("UP") @map("time_rounding_mode")
+  jobStatusLabels        Json     @default("{}") @map("job_status_labels")
+  retiredJobStatuses     String[] @default([]) @map("retired_job_statuses")
+  priorityLabels         Json     @default("{}") @map("priority_labels")
+  jobRequiredFields      String[] @default([]) @map("job_required_fields")
+  vehicleRequiredFields  String[] @default([]) @map("vehicle_required_fields")
+  vehicleMileageRequired Boolean  @default(false) @map("vehicle_mileage_required")
+  enabledFuelTypes       String[] @default([]) @map("enabled_fuel_types")
+  enabledTransmissions   String[] @default([]) @map("enabled_transmissions")
+  enabledDriveTypes      String[] @default([]) @map("enabled_drive_types")
+  defaultIntervalKm      Int?     @map("default_interval_km")
+  defaultIntervalMonths  Int?     @map("default_interval_months")
+  defaultReorderQuantity Int?     @map("default_reorder_quantity")
+  defaultMarkupBps       Int?     @map("default_markup_bps")
+  reportDefaultRange     String   @default("THIS_MONTH") @map("report_default_range")
+  reportDefaultFormat    String   @default("CSV") @map("report_default_format")
+  slowMovingDays         Int      @default(90) @map("slow_moving_days")
+  lapsedCustomerDays     Int      @default(180) @map("lapsed_customer_days")
+  dashboardHiddenKpis    String[] @default([]) @map("dashboard_hidden_kpis")
+  sessionMaxHours        Int?     @map("session_max_hours")
+  invitationExpiryDays   Int?     @map("invitation_expiry_days")
+  reportRunRetentionDays Int      @default(90) @map("report_run_retention_days")
+  importRetentionDays    Int      @default(30) @map("import_retention_days")
+  updatedById            String?  @map("updated_by_id") @db.Uuid
+  updatedAt              DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+
+  @@map("business_config")
+}
+
+model JobTemplate {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId       String       @map("business_id") @db.Uuid
+  name             String
+  description      String?
+  serviceTypeId    String?      @map("service_type_id") @db.Uuid
+  estimatedMinutes Int?         @map("estimated_minutes")
+  checklist        String[]     @default([])
+  labour           Json         @default("[]")
+  parts            Json         @default("[]")
+  inspectionFields String[]     @default([]) @map("inspection_fields")
+  status           RecordStatus @default(ACTIVE)
+  createdById      String?      @map("created_by_id") @db.Uuid
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business     @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  service  ServiceType? @relation(fields: [serviceTypeId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([id, businessId])
+  @@index([businessId, status])
+  @@map("job_templates")
+}
+
+model SavedReport {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId          String    @map("business_id") @db.Uuid
+  kind                String
+  reportKey           String?   @map("report_key")
+  name                String
+  description         String?
+  config              Json
+  ownerMembershipId   String    @map("owner_membership_id") @db.Uuid
+  visibility          String    @default("PRIVATE")
+  sharedRoleIds       String[]  @default([]) @map("shared_role_ids") @db.Uuid
+  sharedMembershipIds String[]  @default([]) @map("shared_membership_ids") @db.Uuid
+  archivedAt          DateTime? @map("archived_at") @db.Timestamptz(3)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business  Business         @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  schedules ReportSchedule[]
+
+  @@unique([id, businessId])
+  @@index([businessId, ownerMembershipId])
+  @@map("saved_reports")
+}
+
+model ReportSchedule {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId             String    @map("business_id") @db.Uuid
+  savedReportId          String    @map("saved_report_id") @db.Uuid
+  frequency              String
+  weekday                Int?
+  monthDay               Int?      @map("month_day")
+  hour                   Int       @default(7)
+  format                 String    @default("CSV")
+  recipientMembershipIds String[]  @default([]) @map("recipient_membership_ids") @db.Uuid
+  status                 String    @default("ACTIVE")
+  nextRunAt              DateTime  @map("next_run_at") @db.Timestamptz(3)
+  lastRunAt              DateTime? @map("last_run_at") @db.Timestamptz(3)
+  lastStatus             String?   @map("last_status")
+  createdByMembershipId  String    @map("created_by_membership_id") @db.Uuid
+  createdAt              DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business    @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  report   SavedReport @relation(fields: [savedReportId, businessId], references: [id, businessId], onDelete: Restrict)
+  runs     ReportRun[]
+
+  @@unique([id, businessId])
+  @@index([status, nextRunAt])
+  @@index([businessId])
+  @@map("report_schedules")
+}
+
+model ReportRun {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String    @map("business_id") @db.Uuid
+  scheduleId        String    @map("schedule_id") @db.Uuid
+  dueAt             DateTime  @map("due_at") @db.Timestamptz(3)
+  status            String    @default("QUEUED")
+  attempts          Int       @default(0)
+  recipientsSent    Int       @default(0) @map("recipients_sent")
+  recipientsSkipped Int       @default(0) @map("recipients_skipped")
+  error             String?
+  detail            Json?
+  startedAt         DateTime? @map("started_at") @db.Timestamptz(3)
+  finishedAt        DateTime? @map("finished_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  schedule ReportSchedule @relation(fields: [scheduleId, businessId], references: [id, businessId], onDelete: Restrict)
+
+  @@unique([scheduleId, dueAt])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@map("report_runs")
+}
+
+model ImportBatch {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId    String    @map("business_id") @db.Uuid
+  kind          String
+  status        String    @default("UPLOADED")
+  fileName      String    @map("file_name")
+  headers       String[]  @default([])
+  mapping       Json      @default("{}")
+  options       Json      @default("{}")
+  totalRows     Int       @default(0) @map("total_rows")
+  validRows     Int       @default(0) @map("valid_rows")
+  invalidRows   Int       @default(0) @map("invalid_rows")
+  duplicateRows Int       @default(0) @map("duplicate_rows")
+  warningRows   Int       @default(0) @map("warning_rows")
+  importedRows  Int       @default(0) @map("imported_rows")
+  skippedRows   Int       @default(0) @map("skipped_rows")
+  failedRows    Int       @default(0) @map("failed_rows")
+  processedRows Int       @default(0) @map("processed_rows")
+  error         String?
+  createdById   String?   @map("created_by_id") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime  @default(now()) @map("updated_at") @db.Timestamptz(3)
+  completedAt   DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  business Business    @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  rows     ImportRow[]
+
+  @@unique([id, businessId])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@map("import_batches")
+}
+
+model ImportRow {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId  String   @map("business_id") @db.Uuid
+  batchId     String   @map("batch_id") @db.Uuid
+  rowNumber   Int      @map("row_number")
+  raw         Json
+  values      Json?
+  status      String   @default("PENDING")
+  errors      String[] @default([])
+  warnings    String[] @default([])
+  duplicateOf String?  @map("duplicate_of")
+  recordId    String?  @map("record_id") @db.Uuid
+
+  business Business    @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  batch    ImportBatch @relation(fields: [batchId, businessId], references: [id, businessId], onDelete: Cascade)
+
+  @@unique([batchId, rowNumber])
+  @@index([batchId, status])
+  @@map("import_rows")
+}

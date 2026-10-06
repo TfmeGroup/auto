@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Lint (zero warnings allowed)
+        run: npm run lint
+      - name: Typecheck (app and tests, strict, no unused locals)
+        run: npm run typecheck
+      # The suite starts its own real PostgreSQL (embedded binaries), applies the real
+      # migrations with `prisma migrate deploy`, and exercises RLS as the restricted role.
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npx next build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+      - name: Dependency audit (high/critical, with documented exceptions)
+        run: node scripts/audit-gate.cjs
