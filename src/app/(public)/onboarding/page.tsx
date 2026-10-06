@@ -4,6 +4,7 @@ import { Alert } from '@/components/ui';
 import { listMyBusinesses } from '@/server/businesses/service';
 import { requireUser } from '@/server/web/session';
 import { CreateBusinessForm } from './CreateBusinessForm';
+import { SignOutLink } from './SignOutLink';
 
 export const metadata: Metadata = { title: 'Set up your business' };
 export const dynamic = 'force-dynamic';
@@ -26,6 +27,7 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
         <Alert tone="warn">Verify your email address first — we sent you a link. You can create your business as soon as it is confirmed.</Alert>
       )}
       <CreateBusinessForm canCreate={user.user.emailVerified} />
+      <SignOutLink email={user.user.email} />
       <p className="border-t border-line pt-4 text-sm text-muted">
         Joining an existing workshop instead? Open the invitation link in your invitation email while signed in with the invited address.
       </p>
